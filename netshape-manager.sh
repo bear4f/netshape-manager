@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="2.0.0"
+VERSION="2.0.1"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -314,15 +314,19 @@ apply_shape() {
 
   (( RATE_MBPS >= 10 && RATE_MBPS <= 100000 )) || die "无效限速：${RATE_MBPS}Mbps"
   info "正在应用 ${RATE_MBPS}Mbit 总出口保护：$iface"
-  if ! tc qdisc replace dev "$iface" root handle 1: htb default 10 r2q 1000; then
+  # Some kernels/qdiscs cannot change an existing fq root into HTB with
+  # `replace` and return EOPNOTSUPP. Remove the old root first so every
+  # subsequent object is created against a known-empty hierarchy.
+  tc qdisc del dev "$iface" root 2>/dev/null || true
+  if ! tc qdisc add dev "$iface" root handle 1: htb default 10 r2q 1000; then
     restore_fq "$iface"
     die "HTB 创建失败，已尝试恢复 fq"
   fi
-  if ! tc class replace dev "$iface" parent 1: classid 1:10 htb rate "${RATE_MBPS}mbit" ceil "${RATE_MBPS}mbit" burst "${burst_kb}kb" cburst "${burst_kb}kb" quantum 15140; then
+  if ! tc class add dev "$iface" parent 1: classid 1:10 htb rate "${RATE_MBPS}mbit" ceil "${RATE_MBPS}mbit" burst "${burst_kb}kb" cburst "${burst_kb}kb" quantum 15140; then
     restore_fq "$iface"
     die "HTB class 创建失败，已尝试恢复 fq"
   fi
-  if ! tc qdisc replace dev "$iface" parent 1:10 handle 10: fq; then
+  if ! tc qdisc add dev "$iface" parent 1:10 handle 10: fq; then
     restore_fq "$iface"
     die "fq 子队列创建失败，已尝试恢复 fq"
   fi
@@ -494,7 +498,7 @@ diagnose() {
   done
   (( found == 0 )) && printf '  未发现明显的重复 TCP 配置。\n'
   if has systemctl; then
-    for file in tc-fq-maxrate.service netpace.service; do
+    for file in netshape.service tc-fq-maxrate.service netpace.service; do
       systemctl is-enabled "$file" >/dev/null 2>&1 && printf '  可能冲突的服务：%s\n' "$file"
     done
   fi
@@ -559,7 +563,7 @@ wizard() {
 disable_known_conflicts() {
   local unit found=0
   : > "$STATE_DIR/disabled-services"
-  for unit in tc-fq-maxrate.service netpace.service; do
+  for unit in netshape.service tc-fq-maxrate.service netpace.service; do
     if systemctl is-enabled "$unit" >/dev/null 2>&1 || systemctl is-active "$unit" >/dev/null 2>&1; then
       systemctl disable --now "$unit" >/dev/null 2>&1 || true
       printf '%s\n' "$unit" >> "$STATE_DIR/disabled-services"
