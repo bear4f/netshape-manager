@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="3.0.0"
+VERSION="3.0.1"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -556,7 +556,7 @@ write_nginx_snippet() {
     printf '%s\n' 'proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;'
     printf '%s\n' 'proxy_set_header X-Forwarded-Proto $scheme;'
     printf '%s\n' 'proxy_set_header Upgrade $http_upgrade;'
-    printf '%s\n' 'proxy_set_header Connection "upgrade";'
+    printf '%s\n' 'proxy_set_header Connection $http_connection;'
     printf '%s\n' 'proxy_buffering off;'
     printf '%s\n' 'proxy_request_buffering off;'
     printf '%s\n' 'proxy_max_temp_file_size 0;'
