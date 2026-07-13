@@ -37,6 +37,20 @@ assert_eq 'fq maxrate（单条 TCP 连接上限）' "$(queue_label on perflow fq
 assert_eq 'TBF + fq（兼容整机总出口）' "$(queue_label on total tbf)" 'total TBF queue label'
 assert_eq 'fq（连接公平排队，不限速）' "$(queue_label off total htb)" 'paused queue label'
 
+render_test() {
+  SHAPING="$1" LIMIT_MODE="$2" RATE_MBPS="$3" RTT_MS=160 SHAPER_MODE="$4"
+  render_menu
+}
+menu_out="$(render_test on adaptive 950 fq)"
+[[ "$menu_out" == *'▸ 1) 多设备自适应'* ]] || { printf 'FAIL: adaptive menu marker\n' >&2; exit 1; }
+printf 'PASS: adaptive menu marker\n'
+menu_out="$(render_test on perflow 450 fq)"
+[[ "$menu_out" == *'▸ 2) 单条 TCP 连接上限 450'* ]] || { printf 'FAIL: perflow 450 menu marker\n' >&2; exit 1; }
+printf 'PASS: perflow 450 menu marker\n'
+menu_out="$(render_test off adaptive 950 fq)"
+[[ "$menu_out" == *'已暂停人为限速'* && "$menu_out" != *'▸ 1)'* ]] || { printf 'FAIL: paused menu state\n' >&2; exit 1; }
+printf 'PASS: paused menu state\n'
+
 tc_log="$(mktemp)"
 need_root() { :; }
 has() { return 0; }

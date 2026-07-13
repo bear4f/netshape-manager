@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="3.0.2"
+VERSION="3.1.0"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -19,12 +19,27 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+DIM='\033[2m'
 BOLD='\033[1m'
 RESET='\033[0m'
 
 if [[ ! -t 1 || "${NO_COLOR:-}" ]]; then
-  RED='' GREEN='' YELLOW='' BLUE='' BOLD='' RESET=''
+  RED='' GREEN='' YELLOW='' BLUE='' CYAN='' DIM='' BOLD='' RESET=''
 fi
+
+RULE_HEAVY='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
+RULE_LIGHT='──────────────────────────────────────'
+
+rule_heavy() { printf '%b%s%b\n' "$CYAN" "$RULE_HEAVY" "$RESET"; }
+rule_light() { printf '%b%s%b\n' "$DIM" "$RULE_LIGHT" "$RESET"; }
+
+panel_title() {
+  printf '\n'
+  rule_heavy
+  printf '%b  %s%b  %bv%s%b\n' "$BOLD" "$1" "$RESET" "$DIM" "$VERSION" "$RESET"
+  rule_heavy
+}
 
 log()  { printf '%b[OK]%b %s\n' "$GREEN" "$RESET" "$*"; }
 info() { printf '%b[INFO]%b %s\n' "$BLUE" "$RESET" "$*"; }
@@ -591,7 +606,7 @@ nginx_audit() {
     rm -f "$output"
     die "nginx -T 失败，请先修复 Nginx 配置"
   fi
-  printf '%s\n' '=== 可能影响 Emby 的限速/超时指令 ==='
+  printf '%b▸ 可能影响 Emby 的限速/超时指令%b\n' "$BOLD" "$RESET"
   if ! grep -En '^[[:space:]]*(limit_rate|proxy_limit_rate|limit_conn|limit_req|proxy_(read|send)_timeout)[[:space:]]' "$output"; then
     printf '%s\n' '未发现显式限速指令。'
   fi
@@ -609,7 +624,7 @@ show_status() {
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown')"
   qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf 'unknown')"
 
-  printf '%bNetShape Manager %s%b\n' "$BOLD" "$VERSION" "$RESET"
+  panel_title 'NetShape 状态'
   printf '  系统:      %s\n' "$(uname -srmo 2>/dev/null || uname -a)"
   printf '  CPU/RAM:   %s vCPU / %s MB RAM / %s MB Swap\n' "$(cpu_count)" "$mem" "$swap"
   printf '  网卡:      %s\n' "${iface:-未检测到}"
@@ -630,20 +645,20 @@ show_status() {
     printf '  MTU:       %s\n' "$(ip -o link show dev "$iface" 2>/dev/null | sed -n 's/.* mtu \([0-9]*\).*/\1/p')"
   fi
   if [[ -n "$iface" ]] && has tc; then
-    printf '\n=== qdisc ===\n'
+    printf '\n%b▸ qdisc 队列统计%b\n' "$BOLD" "$RESET"
     tc -s qdisc show dev "$iface" 2>/dev/null || true
-    printf '\n=== class ===\n'
+    printf '\n%b▸ 限速类别统计%b\n' "$BOLD" "$RESET"
     tc -s class show dev "$iface" 2>/dev/null || true
   fi
   if has nstat; then
-    printf '\n=== TCP 重传计数（累计）===\n'
+    printf '\n%b▸ TCP 重传计数（累计）%b\n' "$BOLD" "$RESET"
     nstat -az 2>/dev/null | awk '$1 ~ /TcpRetransSegs|TcpExtTCPLostRetransmit|TcpExtTCPFastRetrans/ {print}' || true
   fi
 }
 
 diagnose() {
   show_status
-  printf '\n=== 冲突检查 ===\n'
+  printf '\n%b▸ 冲突检查%b\n' "$BOLD" "$RESET"
   local found=0 file
   for file in /etc/sysctl.conf /etc/sysctl.d/*.conf; do
     [[ -r "$file" && "$file" != "$SYSCTL_FILE" ]] || continue
@@ -679,8 +694,8 @@ wizard() {
   [[ -t 0 ]] || die "交互向导需要终端；自动安装请使用 install --line 500 --rtt 160"
   local mem swap answer custom
   mem="$(mem_total_mb)"; swap="$(swap_total_mb)"
-  printf '%bNetShape 自适应安装向导%b\n' "$BOLD" "$RESET"
-  printf '检测到：%s vCPU，%s MB RAM，%s MB Swap，网卡 %s\n\n' "$(cpu_count)" "$mem" "$swap" "$(detect_iface)"
+  panel_title 'NetShape 安装向导'
+  printf '  检测到：%s vCPU｜%s MB 内存｜%s MB Swap｜网卡 %s\n\n' "$(cpu_count)" "$mem" "$swap" "$(detect_iface)"
   RTT_MS="$(prompt_uint '你本地连接这台 VPS 大约多少毫秒（不知道直接回车）' 160 1 3000)"
   printf '%s\n' \
     '' \
@@ -839,35 +854,57 @@ uninstall_all() {
   log "已卸载 NetShape；Nginx 片段和备份保留，避免破坏现有反代"
 }
 
+render_menu() {
+  local current_text queue_text
+  local m1=' ' m2=' ' m3=' ' m4=' ' m5=' '
+  if [[ "$SHAPING" == off ]]; then
+    current_text="${YELLOW}已暂停人为限速${RESET}（netshape apply 可恢复）"
+  else
+    case "$LIMIT_MODE" in
+      adaptive) current_text='多设备自适应，不限制整机总速度' ;;
+      perflow) current_text="每条 TCP 连接最多 ${RATE_MBPS} Mbps" ;;
+      total) current_text="整台机器合计最多 ${RATE_MBPS} Mbps" ;;
+    esac
+    case "$LIMIT_MODE" in
+      adaptive) m1='▸' ;;
+      perflow)
+        case "$RATE_MBPS" in
+          450) m2='▸' ;;
+          950) m3='▸' ;;
+          *) m4='▸' ;;
+        esac
+        ;;
+      total) m5='▸' ;;
+    esac
+  fi
+  queue_text="$(queue_label "$SHAPING" "$LIMIT_MODE" "$SHAPER_MODE")"
+  panel_title 'NetShape 网络调优面板'
+  printf '  %b当前策略%b  %b%b%b\n' "$DIM" "$RESET" "$GREEN" "$current_text" "$RESET"
+  printf '  %b延迟参考%b  %s ms\n' "$DIM" "$RESET" "$RTT_MS"
+  printf '  %b队列模式%b  %s\n' "$DIM" "$RESET" "$queue_text"
+  rule_light
+  printf '  %b网络策略%b        %b▸ 为当前生效项%b\n' "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '  %b%s%b %b1)%b 多设备自适应（推荐，各设备跑满自己的网络）\n' "$GREEN" "$m1" "$RESET" "$BOLD" "$RESET"
+  printf '  %b%s%b %b2)%b 单条 TCP 连接上限 450 Mbps（适合 500M 线路）\n' "$GREEN" "$m2" "$RESET" "$BOLD" "$RESET"
+  printf '  %b%s%b %b3)%b 单条 TCP 连接上限 950 Mbps（适合 1G 线路）\n' "$GREEN" "$m3" "$RESET" "$BOLD" "$RESET"
+  printf '  %b%s%b %b4)%b 自定义单条 TCP 连接上限\n' "$GREEN" "$m4" "$RESET" "$BOLD" "$RESET"
+  printf '  %b%s%b %b5)%b 高级：整台机器合计上限\n' "$GREEN" "$m5" "$RESET" "$BOLD" "$RESET"
+  printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
+  printf '    %b6)%b 查看状态与重传\n' "$BOLD" "$RESET"
+  printf '    %b7)%b 诊断冲突\n' "$BOLD" "$RESET"
+  printf '    %b8)%b Nginx/Emby 不限流片段与审计\n' "$BOLD" "$RESET"
+  printf '    %b9)%b 修改到本地的大致延迟\n' "$BOLD" "$RESET"
+  printf '    %b0)%b 退出\n' "$BOLD" "$RESET"
+  rule_light
+}
+
 menu() {
   [[ -t 0 ]] || { usage; return; }
+  local answer
   while true; do
     load_config
-    local current_text
-    if [[ "$SHAPING" == off ]]; then
-      current_text='已暂停人为限速（保留 fq 公平排队）；netshape apply 可恢复'
-    else
-      case "$LIMIT_MODE" in
-        adaptive) current_text='不限制整机总速度；不同设备各自适应网络' ;;
-        perflow) current_text="每条 TCP 连接最多 ${RATE_MBPS} Mbps；多设备可同时使用" ;;
-        total) current_text="整台机器所有设备合计最多 ${RATE_MBPS} Mbps" ;;
-      esac
-    fi
-    printf '\n%bNetShape SSH 交互面板%b\n' "$BOLD" "$RESET"
-    printf '当前：%s\n' "$current_text"
-    printf '延迟参考：%sms｜队列：%s\n' "$RTT_MS" "$(queue_label "$SHAPING" "$LIMIT_MODE" "$SHAPER_MODE")"
-    printf '%s\n' \
-      '  1) 多设备/不同网络自适应（推荐，无整机总上限）' \
-      '  2) 每条 TCP 连接最多 450 Mbps' \
-      '  3) 每条 TCP 连接最多 950 Mbps' \
-      '  4) 手动设置单条 TCP 连接上限' \
-      '  5) 高级：设置整台机器合计上限' \
-      '  6) 查看状态与重传' \
-      '  7) 诊断冲突' \
-      '  8) Nginx/Emby 不限流片段与审计' \
-      '  9) 修改到本地的大致延迟' \
-      '  0) 退出'
-    read -r -p '请选择: ' answer
+    render_menu
+    read -r -p '  请选择 [0-9]: ' answer
     case "$answer" in
       1) set_adaptive ;;
       2) set_rate 450 ;;
