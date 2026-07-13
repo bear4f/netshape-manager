@@ -33,7 +33,7 @@
 
 OpenVZ/LXC 等受限容器可能不允许修改 sysctl 或 qdisc。脚本会报告失败，不会声称已经生效。
 
-安装时若检测到会直接覆盖 root qdisc 的旧 `tc-fq-maxrate.service` 或 `netpace.service`，会将其停用并记录；不会删除对应文件。其他 sysctl 或网络服务只报告，不自动修改。
+安装时若检测到会直接覆盖 root qdisc 的旧 `netshape.service`、`tc-fq-maxrate.service` 或 `netpace.service`，会将其停用并记录；不会删除对应文件。其他 sysctl 或网络服务只报告，不自动修改。
 
 ## 安装
 
