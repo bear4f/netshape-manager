@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="5.1.0"
+VERSION="5.2.0"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -723,6 +723,25 @@ nginx_audit() {
   printf '%b▸ 可能影响 Emby 的限速/超时指令%b\n' "$BOLD" "$RESET"
   if ! grep -En '^[[:space:]]*(limit_rate|proxy_limit_rate|limit_conn|limit_req|proxy_(read|send)_timeout)[[:space:]]' "$output"; then
     printf '%s\n' '未发现显式限速指令。'
+  fi
+  printf '\n%b▸ Emby 不限流片段是否已生效%b\n' "$BOLD" "$RESET"
+  if [[ ! -e "$NGINX_SNIPPET" ]]; then
+    warn "尚未生成片段；请先运行 netshape nginx-snippet"
+  elif grep -q 'netshape-emby-proxy\.conf' "$output"; then
+    log "片段已被 include，不限流与关闭缓冲配置生效"
+  else
+    warn "片段已生成，但没有任何站点 include 它，等于没有生效！"
+    info "请在本机 Nginx 反代 Emby 的 location 块中加入："
+    info "  include ${NGINX_SNIPPET};"
+    info "定位站点文件可用：grep -rn proxy_pass /etc/nginx/"
+    info "加入后执行：nginx -t && systemctl reload nginx"
+  fi
+  printf '\n%b▸ 代理缓冲检查（反代掉速的常见根源）%b\n' "$BOLD" "$RESET"
+  if grep -Eq '^[[:space:]]*proxy_buffering[[:space:]]+off' "$output"; then
+    printf '%s\n' '已找到 proxy_buffering off。'
+  else
+    warn "未发现 proxy_buffering off：Nginx 默认把视频流缓冲到磁盘临时文件再转发，"
+    warn "典型症状是速度大幅波动、长时间只有几十兆。include 上述片段即可关闭缓冲。"
   fi
   rm -f "$output"
   info "审计仅报告，不会改动现有站点配置。"

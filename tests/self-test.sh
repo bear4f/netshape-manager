@@ -142,4 +142,18 @@ snippet_out="$(write_nginx_snippet 2>&1)"
 [[ "$snippet_out" == *'跳过 Emby 反代片段'* ]] || { printf 'FAIL: skip snippet without nginx\n' >&2; exit 1; }
 printf 'PASS: skip snippet without nginx\n'
 
+has() { return 0; }
+audit_dir="$(mktemp -d)"
+NGINX_SNIPPET="$audit_dir/netshape-emby-proxy.conf"
+: > "$NGINX_SNIPPET"
+nginx() { printf 'server { location / { proxy_pass http://emby; } }\n'; }
+audit_out="$(nginx_audit 2>&1)"
+[[ "$audit_out" == *'没有任何站点 include'* && "$audit_out" == *'未发现 proxy_buffering off'* ]] || { printf 'FAIL: audit flags missing include\n' >&2; exit 1; }
+printf 'PASS: audit flags missing include\n'
+nginx() { printf 'include %s;\nproxy_buffering off;\n' "$NGINX_SNIPPET"; }
+audit_out="$(nginx_audit 2>&1)"
+[[ "$audit_out" == *'片段已被 include'* && "$audit_out" == *'已找到 proxy_buffering off'* ]] || { printf 'FAIL: audit confirms applied snippet\n' >&2; exit 1; }
+printf 'PASS: audit confirms applied snippet\n'
+rm -rf "$audit_dir"
+
 printf '%s\n' 'All self-tests passed.'
