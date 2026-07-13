@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="5.0.0"
+VERSION="5.1.0"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -1022,7 +1022,7 @@ uninstall_all() {
 
 render_menu() {
   local current_text queue_text total_text
-  local m1=' ' m2=' ' m3=' ' m4=' ' m5=' ' m6=' '
+  local m1=' ' m2=' ' m3=' ' m4=' ' m5=' ' m7=' '
   if (( TOTAL_MBPS > 0 )); then
     total_text="整机 ≤ ${TOTAL_MBPS} Mbps"
   else
@@ -1038,13 +1038,14 @@ render_menu() {
       combo) current_text="单条连接 ≤ ${RATE_MBPS} Mbps｜${total_text}" ;;
     esac
     case "$LIMIT_MODE" in
-      adaptive) m6='▸' ;;
+      adaptive) m7='▸' ;;
       combo|perflow)
         case "$RATE_MBPS" in
           430) m1='▸' ;;
           450) m2='▸' ;;
           850) m3='▸' ;;
           900) m4='▸' ;;
+          *) m5='▸' ;;
         esac
         ;;
     esac
@@ -1060,11 +1061,11 @@ render_menu() {
   printf '  %b%s%b %b2)%b 450 Mbps —— 500M 家宽·速度优先\n' "$GREEN" "$m2" "$RESET" "$BOLD" "$RESET"
   printf '  %b%s%b %b3)%b 850 Mbps —— 1G 家宽·稳定\n' "$GREEN" "$m3" "$RESET" "$BOLD" "$RESET"
   printf '  %b%s%b %b4)%b 900 Mbps —— 1G 家宽·速度优先\n' "$GREEN" "$m4" "$RESET" "$BOLD" "$RESET"
-  printf '  %b%s%b %b5)%b 修改整机总出口%b（按 VPS 端口，当前：%s）%b\n' "$GREEN" "$m5" "$RESET" "$BOLD" "$RESET" "$DIM" "$total_text" "$RESET"
-  printf '  %b%s%b %b6)%b 不限速自适应%b（仅干净直连线路）%b\n' "$GREEN" "$m6" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '  %b%s%b %b5)%b 自定义单条连接上限%b（当前：%s Mbps）%b\n' "$GREEN" "$m5" "$RESET" "$BOLD" "$RESET" "$DIM" "$RATE_MBPS" "$RESET"
+  printf '    %b6)%b 修改整机总出口%b（按 VPS 端口，当前：%s）%b\n' "$BOLD" "$RESET" "$DIM" "$total_text" "$RESET"
+  printf '  %b%s%b %b7)%b 不限速自适应%b（仅干净直连线路）%b\n' "$GREEN" "$m7" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
   printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
-  printf '    %b7)%b 查看状态与重传\n' "$BOLD" "$RESET"
-  printf '    %b8)%b 诊断冲突与 Nginx 审计\n' "$BOLD" "$RESET"
+  printf '    %b8)%b 状态与诊断（重传、冲突、Nginx 审计）\n' "$BOLD" "$RESET"
   printf '    %b9)%b 修改到本地的大致延迟\n' "$BOLD" "$RESET"
   printf '    %b0)%b 退出\n' "$BOLD" "$RESET"
   rule_light
@@ -1082,9 +1083,9 @@ menu() {
       2) set_rate 450 ;;
       3) set_rate 850 ;;
       4) set_rate 900 ;;
-      5) set_total_rate "$(prompt_uint '整机总出口上限（Mbps，0 表示不限）' "$TOTAL_MBPS" 0 100000)" ;;
-      6) if confirm_adaptive; then set_adaptive; else warn "已取消，保持当前策略"; fi ;;
-      7) show_status ;;
+      5) set_rate "$(prompt_uint '单条 TCP 连接上限（Mbps）' "$RATE_MBPS" 10 100000)" ;;
+      6) set_total_rate "$(prompt_uint '整机总出口上限（Mbps，0 表示不限）' "$TOTAL_MBPS" 0 100000)" ;;
+      7) if confirm_adaptive; then set_adaptive; else warn "已取消，保持当前策略"; fi ;;
       8) diagnose ;;
       9) set_rtt "$(prompt_uint '你本地连接这台 VPS 大约多少毫秒' "$RTT_MS" 1 3000)" ;;
       0) return ;;

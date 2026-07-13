@@ -53,8 +53,11 @@ printf 'PASS: combo 430 menu marker\n'
 menu_out="$(render_test on combo 850 htb 2300)"
 [[ "$menu_out" == *'▸ 3) 850 Mbps'* ]] || { printf 'FAIL: combo 850 menu marker\n' >&2; exit 1; }
 printf 'PASS: combo 850 menu marker\n'
+menu_out="$(render_test on combo 600 htb 2300)"
+[[ "$menu_out" == *'▸ 5) 自定义单条连接上限'* && "$menu_out" == *'当前：600 Mbps'* ]] || { printf 'FAIL: custom rate menu marker\n' >&2; exit 1; }
+printf 'PASS: custom rate menu marker\n'
 menu_out="$(render_test on adaptive 450 fq)"
-[[ "$menu_out" == *'▸ 6) 不限速自适应'* ]] || { printf 'FAIL: adaptive menu marker\n' >&2; exit 1; }
+[[ "$menu_out" == *'▸ 7) 不限速自适应'* ]] || { printf 'FAIL: adaptive menu marker\n' >&2; exit 1; }
 printf 'PASS: adaptive menu marker\n'
 menu_out="$(render_test off combo 430 htb 2300)"
 [[ "$menu_out" == *'已暂停人为限速'* && "$menu_out" != *'▸ 1)'* ]] || { printf 'FAIL: paused menu state\n' >&2; exit 1; }
