@@ -31,4 +31,24 @@ assert_eq /proc/sys/net/ipv4/tcp_rmem "$(sysctl_path net.ipv4.tcp_rmem)" 'sysctl
 assert_eq 550 "$(calculate_htb_burst_kb 450)" '450M HTB burst'
 assert_eq 1160 "$(calculate_htb_burst_kb 950)" '950M HTB burst'
 
+tc_log="$(mktemp)"
+need_root() { :; }
+has() { return 0; }
+load_config() { RATE_MBPS=900; SHAPING=on; }
+resolve_iface() { printf '%s\n' eth-test; }
+modprobe() { :; }
+tc() {
+  local first=1 arg
+  for arg in "$@"; do
+    (( first == 1 )) || printf ' ' >> "$tc_log"
+    printf '%s' "$arg" >> "$tc_log"
+    first=0
+  done
+  printf '\n' >> "$tc_log"
+}
+apply_shape >/dev/null
+assert_eq 'qdisc del dev eth-test root' "$(sed -n '1p' "$tc_log")" 'remove old root before HTB'
+assert_eq 'qdisc add dev eth-test root handle 1: htb default 10 r2q 1000' "$(sed -n '2p' "$tc_log")" 'create fresh HTB root'
+rm -f "$tc_log"
+
 printf '%s\n' 'All self-tests passed.'
