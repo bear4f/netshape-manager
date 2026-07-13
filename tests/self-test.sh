@@ -40,21 +40,23 @@ assert_eq 'fq（连接公平排队，不限速）' "$(queue_label on adaptive fq
 assert_eq 'fq maxrate（单条 TCP 连接上限）' "$(queue_label on perflow fq)" 'perflow queue label'
 assert_eq 'TBF + fq（兼容整机总出口）' "$(queue_label on total tbf)" 'total TBF queue label'
 assert_eq 'fq（连接公平排队，不限速）' "$(queue_label off total htb)" 'paused queue label'
+assert_eq 'HTB + fq maxrate（总出口＋单连接上限）' "$(queue_label on combo htb)" 'combo queue label'
+assert_eq 'fq maxrate（单条 TCP 连接上限）' "$(queue_label on combo fq)" 'combo no-total queue label'
 
 render_test() {
-  SHAPING="$1" LIMIT_MODE="$2" RATE_MBPS="$3" RTT_MS=160 SHAPER_MODE="$4"
+  SHAPING="$1" LIMIT_MODE="$2" RATE_MBPS="$3" RTT_MS=160 SHAPER_MODE="$4" TOTAL_MBPS="${5:-0}"
   render_menu
 }
-menu_out="$(render_test on total 430 htb)"
-[[ "$menu_out" == *'▸ 1) 430 Mbps'* ]] || { printf 'FAIL: total 430 menu marker\n' >&2; exit 1; }
-printf 'PASS: total 430 menu marker\n'
-menu_out="$(render_test on total 850 htb)"
-[[ "$menu_out" == *'▸ 3) 850 Mbps'* ]] || { printf 'FAIL: total 850 menu marker\n' >&2; exit 1; }
-printf 'PASS: total 850 menu marker\n'
+menu_out="$(render_test on combo 430 htb 2300)"
+[[ "$menu_out" == *'▸ 1) 430 Mbps'* && "$menu_out" == *'整机 ≤ 2300 Mbps'* ]] || { printf 'FAIL: combo 430 menu marker\n' >&2; exit 1; }
+printf 'PASS: combo 430 menu marker\n'
+menu_out="$(render_test on combo 850 htb 2300)"
+[[ "$menu_out" == *'▸ 3) 850 Mbps'* ]] || { printf 'FAIL: combo 850 menu marker\n' >&2; exit 1; }
+printf 'PASS: combo 850 menu marker\n'
 menu_out="$(render_test on adaptive 450 fq)"
 [[ "$menu_out" == *'▸ 6) 不限速自适应'* ]] || { printf 'FAIL: adaptive menu marker\n' >&2; exit 1; }
 printf 'PASS: adaptive menu marker\n'
-menu_out="$(render_test off total 430 htb)"
+menu_out="$(render_test off combo 430 htb 2300)"
 [[ "$menu_out" == *'已暂停人为限速'* && "$menu_out" != *'▸ 1)'* ]] || { printf 'FAIL: paused menu state\n' >&2; exit 1; }
 printf 'PASS: paused menu state\n'
 
@@ -62,7 +64,8 @@ tc_log="$(mktemp)"
 need_root() { :; }
 has() { return 0; }
 load_config() {
-  RATE_MBPS=900
+  RATE_MBPS="${TEST_RATE_MBPS:-900}"
+  TOTAL_MBPS="${TEST_TOTAL_MBPS:-0}"
   SHAPING=on
   SHAPER_MODE=auto
   LIMIT_MODE="${TEST_LIMIT_MODE:-total}"
@@ -110,6 +113,21 @@ assert_eq tbf "$SHAPER_MODE" 'remember compatible shaper'
 
 : > "$tc_log"
 unset TC_REJECT_CAKE TC_REJECT_HTB
+TEST_LIMIT_MODE=combo
+TEST_RATE_MBPS=430
+TEST_TOTAL_MBPS=2300
+apply_shape >/dev/null
+assert_eq 'class add dev eth-test parent 1: classid 1:10 htb rate 2300mbit ceil 2300mbit burst 2048kb cburst 2048kb quantum 15140' "$(sed -n '3p' "$tc_log")" 'combo HTB total class'
+assert_eq 'qdisc add dev eth-test parent 1:10 handle 10: fq maxrate 430mbit' "$(sed -n '4p' "$tc_log")" 'combo per-flow maxrate child'
+assert_eq htb "$SHAPER_MODE" 'combo records htb'
+
+: > "$tc_log"
+TEST_TOTAL_MBPS=0
+apply_shape >/dev/null
+assert_eq 'qdisc add dev eth-test root fq maxrate 430mbit' "$(sed -n '2p' "$tc_log")" 'combo without total uses fq maxrate'
+assert_eq fq "$SHAPER_MODE" 'combo records fq when total off'
+
+: > "$tc_log"
 TEST_LIMIT_MODE=adaptive
 apply_shape >/dev/null
 assert_eq 'qdisc replace dev eth-test root fq' "$(sed -n '2p' "$tc_log")" 'adaptive mode uses unlimited fq'

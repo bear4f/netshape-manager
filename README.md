@@ -8,10 +8,10 @@
 
 - SSH 中文交互面板；安装后直接运行 `netshape`
 - 自动识别 CPU、RAM、Swap、默认出口网卡、MTU、内核和 BBR 支持
-- 默认整机总出口限速：500M 线路 430/450 档，G口 850/900 档，一键切换
-- 队列优先 CAKE（按设备公平分配，单设备多连接不会挤占其他设备的 Emby 流），内核不支持时自动回退 HTB + fq、再回退 TBF + fq
-- 把总出口压在线路标称值以下，避免 BBR 在跨境/共享线路上持续超发导致重传暴涨和断流
-- 可选不限速自适应与单条 TCP 连接上限，仅推荐丢包极少的干净直连线路
+- 双层限速：单条 TCP 连接压在观看设备家宽以下（500M 家宽→430/450，1G 家宽→850/900），整机总出口按 VPS 端口保护（2.5G 口→2300，1G 口→900，可设 0 不限）
+- 多设备在不同家宽环境同时观看时各自跑满自己的带宽，互不挤占；单条流不会打爆"VPS 到家"的跨境路径（这是重传暴涨和断流的根源）
+- HTB + fq maxrate 实现；HTB 不可用自动回退 TBF，再不行仅保留单连接上限
+- 可选不限速自适应，仅推荐丢包极少的干净直连线路（选择时需二次确认）
 - 询问到本地的大致延迟；不知道可直接使用默认值
 - 自定义单连接上限、整机上限或 RTT 时同步重算 TCP 参数
 - 使用独立 sysctl 文件，不覆盖 `/etc/sysctl.conf`
@@ -49,10 +49,10 @@ sudo netshape
 
 ### 一键无人值守安装
 
-整机总出口 430M、160ms RTT 示例（500M 线路 Emby 稳定推荐）：
+2.5G 口 VPS、观看设备 500M 家宽、160ms RTT 示例：
 
 ```bash
-curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install --non-interactive --rate 430 --rtt 160
+curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install --non-interactive --rate 430 --total 2300 --rtt 160
 ```
 
 ### 本地文件安装
@@ -67,23 +67,26 @@ sudo ./netshape-manager.sh install
 向导会询问：
 
 1. 你本地连接 VPS 大约多少毫秒；不知道可直接回车；
-2. 选择线路档位：500M 线路 430/450，G口 850/900，或自定义总出口；不限速自适应仅适合干净直连线路。
+2. VPS 端口多大（2.5G/1G/500M/不限），决定整机总出口保护；
+3. 观看设备的家宽档位（500M→430/450，1G→850/900），决定单条连接上限。
 
-无人值守安装示例（500M 线路稳定档）：
+无人值守安装示例（2.5G 口、500M 家宽稳定档）：
 
 ```bash
 sudo ./netshape-manager.sh install \
   --non-interactive \
   --rate 430 \
+  --total 2300 \
   --rtt 160
 ```
 
-G口线路稳定档：
+1G 口 VPS、1G 家宽：
 
 ```bash
 sudo ./netshape-manager.sh install \
   --non-interactive \
   --rate 850 \
+  --total 900 \
   --rtt 160
 ```
 
@@ -100,13 +103,12 @@ sudo netshape
 常用快捷命令：
 
 ```bash
-sudo netshape 430                # Emby/多用户稳定（500M 线路推荐）
-sudo netshape 450                # 500M 线路速度优先
-sudo netshape 850                # G口稳定
-sudo netshape 900                # G口速度优先
-sudo netshape total 2300         # 自定义整机总出口
+sudo netshape 430                # 单条连接 ≤430M（500M 家宽·Emby 稳定，推荐）
+sudo netshape 450                # 单条连接 ≤450M（500M 家宽·速度优先）
+sudo netshape 850                # 单条连接 ≤850M（1G 家宽·稳定）
+sudo netshape 900                # 单条连接 ≤900M（1G 家宽·速度优先）
+sudo netshape total 2300         # 整机总出口（按 VPS 端口；0 = 不限制）
 sudo netshape adaptive           # 不限速自适应（仅干净直连线路）
-sudo netshape per-flow 450       # 高级：每条 TCP 连接上限 450 Mbps
 sudo netshape rtt 160            # 更新到本地的大致延迟
 sudo netshape status
 sudo netshape diagnose
@@ -144,13 +146,18 @@ sudo systemctl reload nginx
 
 ## 调优原理
 
-### 1. 为什么默认限制整机总出口
+### 1. 双层限速：单连接上限＋整机总出口
 
-跨境和共享线路普遍存在强制限速（policing）与深度拥塞。BBR 不把丢包当作拥塞信号：不设上限时它会按探测到的峰值带宽持续超发，撞上 policer 后拥塞窗口和重传一起失控（实测 15 秒可产生十几万次重传），Emby 播放随之断流。把整机总出口固定在标称值以下（500M→430/450，1G→850/900），在源头平滑发送速率，重传立刻回到正常水平。
+关键认识：VPS 端口（例如 2.5G）远大于每个观看者的家宽（300M/500M/1G）。重传雪崩发生在"VPS 到某一个家"的路径上——跨境线路普遍有强制限速（policing）与拥塞，BBR 不把丢包当拥塞信号，单条流不设上限时会按探测到的峰值持续超发，撞上 policer 后重传失控（实测 15 秒十几万次），Emby 随之断流。
 
-多台设备本来就共享这台 VPS 的物理线路，总出口档位没有拿走带宽，只是不让发送方进入重传雪崩区。一条 Emby 流通常只需要 20–100 Mbps，430 Mbps 档同时容纳多路播放没有压力。真正的风险是"按连接公平"：一台设备开多条下载连接时可能挤占别人的单连接视频流。因此队列优先使用 CAKE 的 `dual-dsthost` 模式——先按目标设备均分带宽，设备内部再按连接公平——任何一台设备的多连接下载都无法挤掉其他设备的 Emby 流。内核没有 CAKE 时回退 HTB + fq（按连接公平）。
+因此两层限速各管一件事：
 
-不限速自适应模式只适合丢包极少的干净直连线路；`fq maxrate` 单连接上限是高级选项，它限制的是每条流而不是每台设备。
+- **单条 TCP 连接上限（fq maxrate）**：压在观看设备家宽以下（500M 家宽→430/450，1G 家宽→850/900）。每条流从源头就不超发自己那条到家的路径，这是低重传的根本。
+- **整机总出口（HTB）**：按 VPS 端口设置（2.5G 口→2300，1G 口→900），只防止打满物理端口，不参与"分配"带宽。
+
+多设备同时观看时，每台设备的连接各自受单连接上限保护、各自跑满自己的家宽；4–5 人同时用 500M 家宽合计约 2.2G，2.5G 口完全容纳，互不挤占。
+
+不限速自适应模式只适合丢包极少的干净直连线路，选择时需二次确认。
 
 整形只控制服务器发出的流量。它不能修复上游拥塞、入口丢包、源站转码不足或客户端 Wi-Fi 问题。
 
@@ -184,7 +191,7 @@ sudo netshape diagnose
 
 重点观察：
 
-- 队列是否为 CAKE（bandwidth 显示档位值）或 HTB + fq（class 的 rate/ceil 为档位值）；
+- 队列是否为 HTB + fq maxrate（class 的 rate/ceil = 整机总出口，fq 的 maxrate = 单连接上限）；
 - qdisc/class 的 `dropped`、`overlimits` 是否持续快速增长；
 - TCP 重传计数是否在播放时快速增加；
 - Nginx error log 是否出现 upstream timeout、client prematurely closed；
