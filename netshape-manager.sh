@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="3.1.0"
+VERSION="3.1.1"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -563,6 +563,11 @@ set_off() {
 }
 
 write_nginx_snippet() {
+  if ! has nginx; then
+    info "本机未安装 Nginx，已跳过 Emby 反代片段。"
+    info "只做中转、观看别人的 Emby 时不需要此功能；TCP 调优已覆盖中转流量。"
+    return 0
+  fi
   need_root "$@"
   mkdir -p "$(dirname "$NGINX_SNIPPET")"
   if [[ -e "$NGINX_SNIPPET" && ! -e "${NGINX_SNIPPET}.netshape-backup" ]]; then
@@ -892,7 +897,7 @@ render_menu() {
   printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
   printf '    %b6)%b 查看状态与重传\n' "$BOLD" "$RESET"
   printf '    %b7)%b 诊断冲突\n' "$BOLD" "$RESET"
-  printf '    %b8)%b Nginx/Emby 不限流片段与审计\n' "$BOLD" "$RESET"
+  printf '    %b8)%b Nginx/Emby 不限流片段与审计%b（仅本机自建反代时需要）%b\n' "$BOLD" "$RESET" "$DIM" "$RESET"
   printf '    %b9)%b 修改到本地的大致延迟\n' "$BOLD" "$RESET"
   printf '    %b0)%b 退出\n' "$BOLD" "$RESET"
   rule_light

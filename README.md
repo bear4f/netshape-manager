@@ -15,7 +15,7 @@
 - 自定义单连接上限、整机上限或 RTT 时同步重算 TCP 参数
 - 使用独立 sysctl 文件，不覆盖 `/etc/sysctl.conf`
 - 检测旧 sysctl 和旧 `tc` 服务冲突，但不会擅自删除其他工具的配置
-- 生成 Nginx/Emby 不限流片段，并只读审计可能影响播放的限速项
+- 本机装有 Nginx 时生成 Emby 不限流片段并只读审计限速项；未装 Nginx（纯中转）自动跳过
 - systemd 开机恢复、状态查看、重传计数和完整卸载
 
 ## 支持环境
@@ -114,6 +114,8 @@ sudo netshape apply              # 恢复持久化配置
 每次修改策略、上限或 RTT，都会重新计算 TCP 缓冲并应用 qdisc。持久化配置位于 `/etc/netshape-manager.conf`。
 
 ## Emby + Nginx 不限流
+
+仅当这台 VPS 自己运行 Nginx 反代 Emby 时才需要本节。如果你只是通过中转访问别人的 Emby（无法改动对方服务器），跳过本节即可：Emby 流量经过中转机时就是普通 TCP 连接，前面的 TCP 调优已经覆盖。安装时若未检测到本机 Nginx，脚本会自动跳过片段生成并说明原因。
 
 生成片段：
 

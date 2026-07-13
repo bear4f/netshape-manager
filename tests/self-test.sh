@@ -98,4 +98,9 @@ assert_eq 'qdisc replace dev eth-test root fq' "$(sed -n '2p' "$tc_log")" 'adapt
 assert_eq fq "$SHAPER_MODE" 'adaptive mode records fq'
 rm -f "$tc_log"
 
+has() { [[ "$1" != nginx ]]; }
+snippet_out="$(write_nginx_snippet 2>&1)"
+[[ "$snippet_out" == *'跳过 Emby 反代片段'* ]] || { printf 'FAIL: skip snippet without nginx\n' >&2; exit 1; }
+printf 'PASS: skip snippet without nginx\n'
+
 printf '%s\n' 'All self-tests passed.'
