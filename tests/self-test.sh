@@ -31,8 +31,11 @@ assert_eq /proc/sys/net/ipv4/tcp_rmem "$(sysctl_path net.ipv4.tcp_rmem)" 'sysctl
 assert_eq 550 "$(calculate_htb_burst_kb 450)" '450M HTB burst'
 assert_eq 1160 "$(calculate_htb_burst_kb 950)" '950M HTB burst'
 assert_eq '推荐均衡' "$(profile_label balanced)" 'Chinese profile label'
-assert_eq '自动检测' "$(shaper_label auto)" 'Chinese shaper label'
 assert_eq '多设备自适应（不限制整机总速）' "$(limit_mode_label adaptive)" 'adaptive mode label'
+assert_eq 'fq（连接公平排队，不限速）' "$(queue_label on adaptive fq)" 'adaptive queue label'
+assert_eq 'fq maxrate（单条 TCP 连接上限）' "$(queue_label on perflow fq)" 'perflow queue label'
+assert_eq 'TBF + fq（兼容整机总出口）' "$(queue_label on total tbf)" 'total TBF queue label'
+assert_eq 'fq（连接公平排队，不限速）' "$(queue_label off total htb)" 'paused queue label'
 
 tc_log="$(mktemp)"
 need_root() { :; }

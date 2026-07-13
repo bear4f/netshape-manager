@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="3.0.1"
+VERSION="3.0.2"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -151,11 +151,16 @@ profile_label() {
   esac
 }
 
-shaper_label() {
-  case "${1:-}" in
+queue_label() {
+  local shaping="${1:-on}" mode="${2:-}" shaper="${3:-}"
+  if [[ "$shaping" == off || "$mode" == adaptive ]]; then
+    printf 'fq（连接公平排队，不限速）\n'
+    return
+  fi
+  case "$shaper" in
     htb) printf 'HTB + fq（整机总出口）\n' ;;
     tbf) printf 'TBF + fq（兼容整机总出口）\n' ;;
-    fq) printf 'fq maxrate（兼容单连接）\n' ;;
+    fq) printf 'fq maxrate（单条 TCP 连接上限）\n' ;;
     auto) printf '自动检测\n' ;;
     *) printf '未知\n' ;;
   esac
@@ -610,12 +615,16 @@ show_status() {
   printf '  网卡:      %s\n' "${iface:-未检测到}"
   printf '  延迟参考:  %s ms\n' "$RTT_MS"
   printf '  网络策略:  %s\n' "$(limit_mode_label "$LIMIT_MODE")"
-  case "$LIMIT_MODE" in
-    adaptive) printf '  限速状态:  不限制整机总速度\n' ;;
-    perflow) printf '  限速状态:  每条 TCP 连接最多 %s Mbps\n' "$RATE_MBPS" ;;
-    total) printf '  限速状态:  整台机器所有连接合计 %s Mbps\n' "$RATE_MBPS" ;;
-  esac
-  printf '  队列模式:  %s\n' "$(shaper_label "$SHAPER_MODE")"
+  if [[ "$SHAPING" == off ]]; then
+    printf '  限速状态:  已暂停人为限速（保留 fq 公平排队）\n'
+  else
+    case "$LIMIT_MODE" in
+      adaptive) printf '  限速状态:  不限制整机总速度\n' ;;
+      perflow) printf '  限速状态:  每条 TCP 连接最多 %s Mbps\n' "$RATE_MBPS" ;;
+      total) printf '  限速状态:  整台机器所有连接合计 %s Mbps\n' "$RATE_MBPS" ;;
+    esac
+  fi
+  printf '  队列模式:  %s\n' "$(queue_label "$SHAPING" "$LIMIT_MODE" "$SHAPER_MODE")"
   printf '  TCP:       %s + %s / 缓冲建议 %s\n' "$cc" "$qdisc" "$(format_bytes "$tcp_max")"
   if [[ -n "$iface" ]] && has ip; then
     printf '  MTU:       %s\n' "$(ip -o link show dev "$iface" 2>/dev/null | sed -n 's/.* mtu \([0-9]*\).*/\1/p')"
@@ -835,14 +844,18 @@ menu() {
   while true; do
     load_config
     local current_text
-    case "$LIMIT_MODE" in
-      adaptive) current_text='不限制整机总速度；不同设备各自适应网络' ;;
-      perflow) current_text="每条 TCP 连接最多 ${RATE_MBPS} Mbps；多设备可同时使用" ;;
-      total) current_text="整台机器所有设备合计最多 ${RATE_MBPS} Mbps" ;;
-    esac
+    if [[ "$SHAPING" == off ]]; then
+      current_text='已暂停人为限速（保留 fq 公平排队）；netshape apply 可恢复'
+    else
+      case "$LIMIT_MODE" in
+        adaptive) current_text='不限制整机总速度；不同设备各自适应网络' ;;
+        perflow) current_text="每条 TCP 连接最多 ${RATE_MBPS} Mbps；多设备可同时使用" ;;
+        total) current_text="整台机器所有设备合计最多 ${RATE_MBPS} Mbps" ;;
+      esac
+    fi
     printf '\n%bNetShape SSH 交互面板%b\n' "$BOLD" "$RESET"
     printf '当前：%s\n' "$current_text"
-    printf '延迟参考：%sms｜队列：%s\n' "$RTT_MS" "$(shaper_label "$SHAPER_MODE")"
+    printf '延迟参考：%sms｜队列：%s\n' "$RTT_MS" "$(queue_label "$SHAPING" "$LIMIT_MODE" "$SHAPER_MODE")"
     printf '%s\n' \
       '  1) 多设备/不同网络自适应（推荐，无整机总上限）' \
       '  2) 每条 TCP 连接最多 450 Mbps' \
