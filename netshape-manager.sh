@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="2.0.1"
+VERSION="2.1.0"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -141,6 +141,34 @@ calculate_htb_burst_kb() {
   printf '%s\n' "$burst"
 }
 
+profile_label() {
+  case "${1:-}" in
+    speed) printf '速度优先\n' ;;
+    balanced) printf '推荐均衡\n' ;;
+    stable) printf '稳定优先\n' ;;
+    custom) printf '手动设置\n' ;;
+    *) printf '未知\n' ;;
+  esac
+}
+
+shaper_label() {
+  case "${1:-}" in
+    htb) printf 'HTB + fq（整机总出口）\n' ;;
+    tbf) printf 'TBF + fq（兼容整机总出口）\n' ;;
+    fq) printf 'fq maxrate（兼容单连接）\n' ;;
+    auto) printf '自动检测\n' ;;
+    *) printf '未知\n' ;;
+  esac
+}
+
+line_reference_label() {
+  case "${1:-}" in
+    500) printf '不知道/约 500 Mbps\n' ;;
+    1000) printf '约 1 Gbps\n' ;;
+    *) printf '自定义 %s Mbps\n' "${1:-未知}" ;;
+  esac
+}
+
 format_bytes() {
   local bytes="$1"
   if (( bytes >= 1073741824 )); then
@@ -159,6 +187,7 @@ default_config() {
   RATE_MBPS=430
   SHAPING="on"
   IFACE="auto"
+  SHAPER_MODE="auto"
 }
 
 load_config() {
@@ -173,6 +202,7 @@ load_config() {
       RATE_MBPS) is_uint "$value" && RATE_MBPS="$value" ;;
       SHAPING) [[ "$value" =~ ^(on|off)$ ]] && SHAPING="$value" ;;
       IFACE) [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
+      SHAPER_MODE) [[ "$value" =~ ^(auto|htb|tbf|fq)$ ]] && SHAPER_MODE="$value" ;;
     esac
   done < "$CONFIG_FILE"
 }
@@ -190,6 +220,7 @@ save_config() {
     printf 'RATE_MBPS=%s\n' "$RATE_MBPS"
     printf 'SHAPING=%s\n' "$SHAPING"
     printf 'IFACE=%s\n' "$IFACE"
+    printf 'SHAPER_MODE=%s\n' "$SHAPER_MODE"
   } > "$temp"
   mv -f "$temp" "$CONFIG_FILE"
 }
@@ -204,7 +235,7 @@ append_sysctl() {
   if [[ -e "$path" ]]; then
     printf '%s = %s\n' "$key" "$value" >> "$file"
   else
-    warn "当前内核不支持 $key，已跳过"
+    warn "当前内核不支持 ${key}，已跳过"
   fi
 }
 
@@ -275,7 +306,7 @@ write_sysctl_profile() {
   if has sysctl; then
     sysctl -p "$SYSCTL_FILE" >/dev/null || die "sysctl 加载失败；配置文件保留在 $SYSCTL_FILE 供检查"
   fi
-  log "TCP 配置已更新：$cc，缓冲上限 $(format_bytes "$tcp_max")，notsent ${notsent}B"
+  log "TCP 配置已更新：${cc}，缓冲上限 $(format_bytes "$tcp_max")，notsent ${notsent}B"
   if (( tcp_max < RATE_MBPS * RTT_MS * 125 )); then
     warn "内存较小，TCP 缓冲上限低于单流 BDP；高 RTT 下单连接可能无法跑满线路"
   fi
@@ -297,14 +328,40 @@ restore_fq() {
     tc qdisc replace dev "$iface" root fq_codel 2>/dev/null || true
 }
 
+try_htb_fq() {
+  local iface="$1" rate="$2" burst_kb="$3" error_file="$4"
+  tc qdisc del dev "$iface" root 2>/dev/null || true
+  tc qdisc add dev "$iface" root handle 1: htb default 10 r2q 1000 2> "$error_file" || return 1
+  tc class add dev "$iface" parent 1: classid 1:10 htb rate "${rate}mbit" ceil "${rate}mbit" burst "${burst_kb}kb" cburst "${burst_kb}kb" quantum 15140 2>> "$error_file" || return 1
+  tc qdisc add dev "$iface" parent 1:10 handle 10: fq 2>> "$error_file" || return 1
+}
+
+try_tbf_fq() {
+  local iface="$1" rate="$2" burst_kb="$3" error_file="$4"
+  tc qdisc del dev "$iface" root 2>/dev/null || true
+  tc qdisc add dev "$iface" root handle 1: tbf rate "${rate}mbit" burst "${burst_kb}kb" latency 50ms 2> "$error_file" || return 1
+  tc qdisc add dev "$iface" parent 1:1 handle 10: fq 2>> "$error_file" || return 1
+}
+
+try_fq_maxrate() {
+  local iface="$1" rate="$2" error_file="$3"
+  tc qdisc del dev "$iface" root 2>/dev/null || true
+  tc qdisc add dev "$iface" root fq maxrate "${rate}mbit" 2> "$error_file" || return 1
+}
+
 apply_shape() {
   need_root "$@"
   has tc || die "缺少 tc；请先安装 iproute2"
   load_config
-  local iface burst_kb
+  local iface burst_kb requested_mode selected_mode='' error_file detail
   iface="$(resolve_iface)"
   burst_kb="$(calculate_htb_burst_kb "$RATE_MBPS")"
-  has modprobe && { modprobe sch_htb >/dev/null 2>&1 || true; modprobe sch_fq >/dev/null 2>&1 || true; }
+  requested_mode="$SHAPER_MODE"
+  has modprobe && {
+    modprobe sch_htb >/dev/null 2>&1 || true
+    modprobe sch_tbf >/dev/null 2>&1 || true
+    modprobe sch_fq >/dev/null 2>&1 || true
+  }
 
   if [[ "$SHAPING" == off ]]; then
     restore_fq "$iface"
@@ -313,24 +370,50 @@ apply_shape() {
   fi
 
   (( RATE_MBPS >= 10 && RATE_MBPS <= 100000 )) || die "无效限速：${RATE_MBPS}Mbps"
-  info "正在应用 ${RATE_MBPS}Mbit 总出口保护：$iface"
-  # Some kernels/qdiscs cannot change an existing fq root into HTB with
-  # `replace` and return EOPNOTSUPP. Remove the old root first so every
-  # subsequent object is created against a known-empty hierarchy.
-  tc qdisc del dev "$iface" root 2>/dev/null || true
-  if ! tc qdisc add dev "$iface" root handle 1: htb default 10 r2q 1000; then
-    restore_fq "$iface"
-    die "HTB 创建失败，已尝试恢复 fq"
+  info "正在设置整台机器总出口上限：${RATE_MBPS} Mbps（网卡 ${iface}）"
+  error_file="$(mktemp)"
+
+  if [[ "$requested_mode" == auto || "$requested_mode" == htb ]]; then
+    if try_htb_fq "$iface" "$RATE_MBPS" "$burst_kb" "$error_file"; then
+      selected_mode=htb
+    fi
   fi
-  if ! tc class add dev "$iface" parent 1: classid 1:10 htb rate "${RATE_MBPS}mbit" ceil "${RATE_MBPS}mbit" burst "${burst_kb}kb" cburst "${burst_kb}kb" quantum 15140; then
-    restore_fq "$iface"
-    die "HTB class 创建失败，已尝试恢复 fq"
+
+  if [[ -z "$selected_mode" && "$requested_mode" != fq ]]; then
+    if try_tbf_fq "$iface" "$RATE_MBPS" "$burst_kb" "$error_file"; then
+      selected_mode=tbf
+    fi
   fi
-  if ! tc qdisc add dev "$iface" parent 1:10 handle 10: fq; then
-    restore_fq "$iface"
-    die "fq 子队列创建失败，已尝试恢复 fq"
+
+  if [[ -z "$selected_mode" ]]; then
+    if try_fq_maxrate "$iface" "$RATE_MBPS" "$error_file"; then
+      selected_mode=fq
+    fi
   fi
-  log "已应用 HTB + fq：${RATE_MBPS}Mbit（所有连接共享总上限，连接之间公平排队）"
+
+  if [[ -z "$selected_mode" ]]; then
+    detail="$(tail -n 1 "$error_file" 2>/dev/null || true)"
+    rm -f "$error_file"
+    restore_fq "$iface"
+    die "当前 VPS 不允许创建可用的限速队列，已恢复普通 fq。${detail:+ 内核返回：$detail}"
+  fi
+  rm -f "$error_file"
+
+  if [[ "$selected_mode" != "$requested_mode" ]]; then
+    SHAPER_MODE="$selected_mode"
+    save_config
+  fi
+
+  case "$selected_mode" in
+    htb) log "已启用 HTB + fq：整台机器所有连接合计不超过 ${RATE_MBPS} Mbps" ;;
+    tbf)
+      warn "本机不支持 HTB，已自动切换到兼容模式 TBF + fq"
+      log "整台机器所有连接合计不超过 ${RATE_MBPS} Mbps"
+      ;;
+    fq)
+      warn "本机不支持整机队列，已使用 fq maxrate；该模式限制单个连接，不保证整机合计上限"
+      ;;
+  esac
 }
 
 apply_all() {
@@ -380,8 +463,8 @@ set_rtt() {
 
 set_line() {
   local line="${1:-}"
-  is_uint "$line" || die "线路带宽必须是整数 Mbps，例如 500 或 1000"
-  (( line >= 10 && line <= 100000 )) || die "线路带宽范围为 10-100000 Mbps"
+  is_uint "$line" || die "计算参考速度必须是整数 Mbps，例如 500 或 1000"
+  (( line >= 10 && line <= 100000 )) || die "计算参考速度范围为 10-100000 Mbps"
   need_root "$@"
   load_config
   LINE_MBPS="$line"
@@ -466,9 +549,11 @@ show_status() {
   printf '  系统:      %s\n' "$(uname -srmo 2>/dev/null || uname -a)"
   printf '  CPU/RAM:   %s vCPU / %s MB RAM / %s MB Swap\n' "$(cpu_count)" "$mem" "$swap"
   printf '  网卡:      %s\n' "${iface:-未检测到}"
-  printf '  线路/RTT:  %s Mbps / %s ms\n' "$LINE_MBPS" "$RTT_MS"
-  printf '  档位:      %s\n' "$PROFILE"
-  printf '  整形:      %s / %s Mbps\n' "$SHAPING" "$RATE_MBPS"
+  printf '  带宽参考:  %s\n' "$(line_reference_label "$LINE_MBPS")"
+  printf '  延迟参考:  %s ms\n' "$RTT_MS"
+  printf '  当前方案:  %s\n' "$(profile_label "$PROFILE")"
+  printf '  总出口:    %s / %s Mbps（整台机器合计）\n' "$SHAPING" "$RATE_MBPS"
+  printf '  队列模式:  %s\n' "$(shaper_label "$SHAPER_MODE")"
   printf '  TCP:       %s + %s / 缓冲建议 %s\n' "$cc" "$qdisc" "$(format_bytes "$tcp_max")"
   if [[ -n "$iface" ]] && has ip; then
     printf '  MTU:       %s\n' "$(ip -o link show dev "$iface" 2>/dev/null | sed -n 's/.* mtu \([0-9]*\).*/\1/p')"
@@ -518,6 +603,31 @@ prompt_uint() {
   done
 }
 
+prompt_line_reference() {
+  local answer custom
+  while true; do
+    printf '%s\n' \
+      '' \
+      '请选择最接近的情况（这里只用于计算安全余量）：' \
+      '  1) 不知道/不确定（推荐，先按常见 500M 计算）' \
+      '  2) 套餐或服务商写着约 500 Mbps' \
+      '  3) 套餐或服务商写着约 1 Gbps' \
+      '  4) 我知道具体数值' >&2
+    read -r -p '请选择 [1]: ' answer
+    case "${answer:-1}" in
+      1) printf '500\n'; return ;;
+      2) printf '500\n'; return ;;
+      3) printf '1000\n'; return ;;
+      4)
+        custom="$(prompt_uint '请输入服务商标注的 Mbps 数值' 500 10 100000)"
+        printf '%s\n' "$custom"
+        return
+        ;;
+      *) warn "请输入 1、2、3 或 4" ;;
+    esac
+  done
+}
+
 wizard() {
   need_root "$@"
   [[ -t 0 ]] || die "交互向导需要终端；自动安装请使用 install --line 500 --rtt 160"
@@ -525,33 +635,34 @@ wizard() {
   mem="$(mem_total_mb)"; swap="$(swap_total_mb)"
   printf '%bNetShape 自适应安装向导%b\n' "$BOLD" "$RESET"
   printf '检测到：%s vCPU，%s MB RAM，%s MB Swap，网卡 %s\n\n' "$(cpu_count)" "$mem" "$swap" "$(detect_iface)"
-  LINE_MBPS="$(prompt_uint '线路标称带宽（Mbps）' 500 10 100000)"
-  RTT_MS="$(prompt_uint '线路机到本地的往返延迟 RTT（ms）' 160 1 3000)"
+  LINE_MBPS="$(prompt_line_reference)"
+  RTT_MS="$(prompt_uint '你本地连接这台 VPS 大约多少毫秒（不知道直接回车）' 160 1 3000)"
   PROFILE="$(default_profile_for_rtt "$RTT_MS")"
   suggested="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
-  printf '按 RTT 推荐 %s 档，整机总出口 %s Mbps。\n' "$PROFILE" "$suggested"
-  read -r -p "选择 [Enter=接受/s=速度/b=均衡/t=稳定/c=自定义]: " answer
+  printf '\n推荐方案：%s\n' "$(profile_label "$PROFILE")"
+  printf '整台机器所有用户合计上限：%s Mbps\n' "$suggested"
+  read -r -p "选择 [Enter=接受/2=速度优先/3=推荐均衡/4=稳定优先/5=手动]: " answer
   case "${answer:-accept}" in
-    s|S|speed)
+    2)
       PROFILE="speed"
       RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
       ;;
-    b|B|balanced)
+    3)
       PROFILE="balanced"
       RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
       ;;
-    t|T|stable)
+    4)
       PROFILE="stable"
       RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
       ;;
-    c|C)
+    5)
       custom="$(prompt_uint '自定义总出口上限（Mbps）' "$suggested" 10 100000)"
       PROFILE="custom"
       RATE_MBPS="$custom"
       ;;
     *) RATE_MBPS="$suggested" ;;
   esac
-  SHAPING="on"; IFACE="auto"
+  SHAPING="on"; IFACE="auto"; SHAPER_MODE="auto"
   save_config
   install_files
   apply_all
@@ -663,14 +774,19 @@ menu() {
   [[ -t 0 ]] || { usage; return; }
   while true; do
     load_config
+    local speed_rate balanced_rate stable_rate
+    speed_rate="$(recommended_rate "$LINE_MBPS" speed)"
+    balanced_rate="$(recommended_rate "$LINE_MBPS" balanced)"
+    stable_rate="$(recommended_rate "$LINE_MBPS" stable)"
     printf '\n%bNetShape SSH 交互面板%b\n' "$BOLD" "$RESET"
-    printf '当前：线路 %sM / RTT %sms / %s / 限速 %sM\n' "$LINE_MBPS" "$RTT_MS" "$PROFILE" "$RATE_MBPS"
+    printf '当前总出口上限：%s Mbps（整台机器所有用户合计）\n' "$RATE_MBPS"
+    printf '当前方案：%s｜延迟参考：%sms｜队列：%s\n' "$(profile_label "$PROFILE")" "$RTT_MS" "$(shaper_label "$SHAPER_MODE")"
     printf '%s\n' \
-      '  1) 自动重测参数（询问线路与 RTT）' \
-      '  2) 速度档（500M→450M，1G→950M）' \
-      '  3) 均衡档（500M→430M，1G→900M）' \
-      '  4) 稳定档（500M→400M，1G→850M）' \
-      '  5) 自定义整机总出口' \
+      '  1) 重新设置（不知道带宽也能使用）' \
+      "  2) 速度优先：调整到 ${speed_rate} Mbps" \
+      "  3) 推荐均衡：调整到 ${balanced_rate} Mbps（建议）" \
+      "  4) 稳定优先：调整到 ${stable_rate} Mbps（断流时使用）" \
+      '  5) 手动填写整台机器总出口上限' \
       '  6) 查看状态与重传' \
       '  7) 诊断冲突' \
       '  8) Nginx/Emby 不限流片段与审计' \
@@ -695,7 +811,7 @@ menu() {
 
 usage() {
   cat <<'EOF'
-NetShape Manager - 自适应 TCP/BBR + HTB/fq SSH 面板
+NetShape Manager - 自适应 TCP/BBR + 兼容限速 SSH 面板
 
 首次安装：
   sudo bash netshape-manager.sh install
@@ -703,11 +819,11 @@ NetShape Manager - 自适应 TCP/BBR + HTB/fq SSH 面板
 
 安装后：
   netshape                 打开 SSH 交互面板
-  netshape profile speed   500M→450M / 1G→950M
-  netshape profile balanced
-  netshape profile stable
+  netshape profile speed   速度优先
+  netshape profile balanced  推荐均衡
+  netshape profile stable  稳定优先
   netshape rate 470        自定义总出口 Mbps，并同步 TCP 参数
-  netshape line 1000       更新线路带宽并重算
+  netshape line 1000       更新计算参考速度并重算
   netshape rtt 160         更新 RTT 并重算
   netshape 450             rate 450 的简写
   netshape off             暂停 HTB，总出口恢复 fq
@@ -718,7 +834,7 @@ NetShape Manager - 自适应 TCP/BBR + HTB/fq SSH 面板
   netshape nginx-audit     只读审计 Nginx 限速项
   netshape uninstall       卸载自身
 
-说明：Nginx 片段取消的是应用层单请求限速；HTB 仍保护整机总出口。
+说明：Nginx 片段取消的是应用层单请求限速；NetShape 仍保护服务器出口。
 EOF
 }
 
@@ -741,7 +857,7 @@ main() {
     help|-h|--help) usage ;;
     version|--version) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     *)
-      if is_uint "$command"; then set_rate "$command"; else die "未知命令：$command（用 --help 查看帮助）"; fi
+      if is_uint "$command"; then set_rate "$command"; else die "未知命令：${command}（用 --help 查看帮助）"; fi
       ;;
   esac
 }
