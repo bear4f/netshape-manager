@@ -83,22 +83,33 @@ tc() {
     first=0
   done
   printf '\n' >> "$tc_log"
+  if [[ "${TC_REJECT_CAKE:-0}" == 1 && " $line " == *' cake '* ]]; then
+    return 1
+  fi
   if [[ "${TC_REJECT_HTB:-0}" == 1 && " $line " == *' htb '* ]]; then
     return 1
   fi
 }
 apply_shape >/dev/null
-assert_eq 'qdisc del dev eth-test root' "$(sed -n '1p' "$tc_log")" 'remove old root before HTB'
-assert_eq 'qdisc add dev eth-test root handle 1: htb default 10 r2q 1000' "$(sed -n '2p' "$tc_log")" 'create fresh HTB root'
+assert_eq 'qdisc del dev eth-test root' "$(sed -n '1p' "$tc_log")" 'remove old root before shaping'
+assert_eq 'qdisc add dev eth-test root cake bandwidth 900mbit besteffort dual-dsthost' "$(sed -n '2p' "$tc_log")" 'prefer CAKE per-device fairness'
+assert_eq cake "$SHAPER_MODE" 'remember CAKE shaper'
 
 : > "$tc_log"
+TC_REJECT_CAKE=1
+apply_shape >/dev/null 2>&1
+assert_eq 'qdisc add dev eth-test root handle 1: htb default 10 r2q 1000' "$(sed -n '4p' "$tc_log")" 'fallback to HTB root'
+assert_eq htb "$SHAPER_MODE" 'remember HTB shaper'
+
+: > "$tc_log"
+TC_REJECT_CAKE=1
 TC_REJECT_HTB=1
 apply_shape >/dev/null 2>&1
-assert_eq 'qdisc add dev eth-test root handle 1: tbf rate 900mbit burst 1099kb latency 50ms' "$(sed -n '4p' "$tc_log")" 'fallback to TBF root'
+assert_eq 'qdisc add dev eth-test root handle 1: tbf rate 900mbit burst 1099kb latency 50ms' "$(sed -n '6p' "$tc_log")" 'fallback to TBF root'
 assert_eq tbf "$SHAPER_MODE" 'remember compatible shaper'
 
 : > "$tc_log"
-unset TC_REJECT_HTB
+unset TC_REJECT_CAKE TC_REJECT_HTB
 TEST_LIMIT_MODE=adaptive
 apply_shape >/dev/null
 assert_eq 'qdisc replace dev eth-test root fq' "$(sed -n '2p' "$tc_log")" 'adaptive mode uses unlimited fq'

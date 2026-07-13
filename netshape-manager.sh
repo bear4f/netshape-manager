@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="4.1.0"
+VERSION="4.2.0"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -182,7 +182,8 @@ queue_label() {
     return
   fi
   case "$shaper" in
-    htb) printf 'HTB + fq（整机总出口）\n' ;;
+    cake) printf 'CAKE（整机总出口＋按设备公平）\n' ;;
+    htb) printf 'HTB + fq（整机总出口，按连接公平）\n' ;;
     tbf) printf 'TBF + fq（兼容整机总出口）\n' ;;
     fq) printf 'fq maxrate（单条 TCP 连接上限）\n' ;;
     auto) printf '自动检测\n' ;;
@@ -241,7 +242,7 @@ load_config() {
       RATE_MBPS) is_uint "$value" && RATE_MBPS="$value" ;;
       SHAPING) [[ "$value" =~ ^(on|off)$ ]] && SHAPING="$value" ;;
       IFACE) [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
-      SHAPER_MODE) [[ "$value" =~ ^(auto|htb|tbf|fq)$ ]] && SHAPER_MODE="$value" ;;
+      SHAPER_MODE) [[ "$value" =~ ^(auto|cake|htb|tbf|fq)$ ]] && SHAPER_MODE="$value" ;;
       LIMIT_MODE) [[ "$value" =~ ^(adaptive|perflow|total)$ ]] && LIMIT_MODE="$value" ;;
     esac
   done < "$CONFIG_FILE"
@@ -384,6 +385,14 @@ restore_fq() {
     tc qdisc replace dev "$iface" root fq_codel 2>/dev/null || true
 }
 
+try_cake() {
+  # dual-dsthost: fair share per destination device first, then per flow,
+  # so one device's multi-connection download cannot starve another's stream.
+  local iface="$1" rate="$2" error_file="$3"
+  tc qdisc del dev "$iface" root 2>/dev/null || true
+  tc qdisc add dev "$iface" root cake bandwidth "${rate}mbit" besteffort dual-dsthost 2> "$error_file" || return 1
+}
+
 try_htb_fq() {
   local iface="$1" rate="$2" burst_kb="$3" error_file="$4"
   tc qdisc del dev "$iface" root 2>/dev/null || true
@@ -414,6 +423,7 @@ apply_shape() {
   burst_kb="$(calculate_htb_burst_kb "$RATE_MBPS")"
   requested_mode="$SHAPER_MODE"
   has modprobe && {
+    modprobe sch_cake >/dev/null 2>&1 || true
     modprobe sch_htb >/dev/null 2>&1 || true
     modprobe sch_tbf >/dev/null 2>&1 || true
     modprobe sch_fq >/dev/null 2>&1 || true
@@ -452,9 +462,15 @@ apply_shape() {
     die "当前 VPS 不支持单连接限速，已恢复不限速 fq。${detail:+ 内核返回：$detail}"
   fi
 
-  info "正在设置整机总出口上限 ${RATE_MBPS} Mbps（HTB/TBF + fq，网卡 ${iface}）"
+  info "正在设置整机总出口上限 ${RATE_MBPS} Mbps（CAKE/HTB/TBF，网卡 ${iface}）"
 
-  if [[ "$requested_mode" == auto || "$requested_mode" == htb ]]; then
+  if [[ "$requested_mode" == auto || "$requested_mode" == cake ]]; then
+    if try_cake "$iface" "$RATE_MBPS" "$error_file"; then
+      selected_mode=cake
+    fi
+  fi
+
+  if [[ -z "$selected_mode" && ( "$requested_mode" == auto || "$requested_mode" == cake || "$requested_mode" == htb ) ]]; then
     if try_htb_fq "$iface" "$RATE_MBPS" "$burst_kb" "$error_file"; then
       selected_mode=htb
     fi
@@ -480,9 +496,10 @@ apply_shape() {
   fi
 
   case "$selected_mode" in
-    htb) log "已启用 HTB + fq：整台机器所有连接合计不超过 ${RATE_MBPS} Mbps" ;;
+    cake) log "已启用 CAKE：总出口 ${RATE_MBPS} Mbps，各设备先均分带宽，单设备多连接不会挤占其他设备" ;;
+    htb) log "已启用 HTB + fq：整台机器所有连接合计不超过 ${RATE_MBPS} Mbps（按连接公平）" ;;
     tbf)
-      warn "本机不支持 HTB，已自动切换到兼容模式 TBF + fq"
+      warn "本机不支持 CAKE 和 HTB，已自动切换到兼容模式 TBF + fq"
       log "整台机器所有连接合计不超过 ${RATE_MBPS} Mbps"
       ;;
   esac
