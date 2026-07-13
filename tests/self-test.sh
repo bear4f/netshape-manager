@@ -30,25 +30,46 @@ assert_eq 8388608 "$(calculate_tcp_max 100 20 256)" 'small-memory floor/cap'
 assert_eq /proc/sys/net/ipv4/tcp_rmem "$(sysctl_path net.ipv4.tcp_rmem)" 'sysctl key path'
 assert_eq 550 "$(calculate_htb_burst_kb 450)" '450M HTB burst'
 assert_eq 1160 "$(calculate_htb_burst_kb 950)" '950M HTB burst'
+assert_eq '推荐均衡' "$(profile_label balanced)" 'Chinese profile label'
+assert_eq '自动检测' "$(shaper_label auto)" 'Chinese shaper label'
 
 tc_log="$(mktemp)"
 need_root() { :; }
 has() { return 0; }
-load_config() { RATE_MBPS=900; SHAPING=on; }
+load_config() {
+  RATE_MBPS=900
+  SHAPING=on
+  SHAPER_MODE=auto
+  LINE_MBPS=1000
+  RTT_MS=160
+  PROFILE=balanced
+  IFACE=auto
+}
+save_config() { :; }
 resolve_iface() { printf '%s\n' eth-test; }
 modprobe() { :; }
 tc() {
-  local first=1 arg
+  local first=1 arg line=''
   for arg in "$@"; do
     (( first == 1 )) || printf ' ' >> "$tc_log"
     printf '%s' "$arg" >> "$tc_log"
+    line="${line}${line:+ }${arg}"
     first=0
   done
   printf '\n' >> "$tc_log"
+  if [[ "${TC_REJECT_HTB:-0}" == 1 && " $line " == *' htb '* ]]; then
+    return 1
+  fi
 }
 apply_shape >/dev/null
 assert_eq 'qdisc del dev eth-test root' "$(sed -n '1p' "$tc_log")" 'remove old root before HTB'
 assert_eq 'qdisc add dev eth-test root handle 1: htb default 10 r2q 1000' "$(sed -n '2p' "$tc_log")" 'create fresh HTB root'
+
+: > "$tc_log"
+TC_REJECT_HTB=1
+apply_shape >/dev/null 2>&1
+assert_eq 'qdisc add dev eth-test root handle 1: tbf rate 900mbit burst 1099kb latency 50ms' "$(sed -n '4p' "$tc_log")" 'fallback to TBF root'
+assert_eq tbf "$SHAPER_MODE" 'remember compatible shaper'
 rm -f "$tc_log"
 
 printf '%s\n' 'All self-tests passed.'
