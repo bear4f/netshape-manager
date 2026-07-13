@@ -8,9 +8,9 @@
 
 - SSH 中文交互面板；安装后直接运行 `netshape`
 - 自动识别 CPU、RAM、Swap、默认出口网卡、MTU、内核和 BBR 支持
-- 默认使用多设备/多网络自适应，不限制整台机器的合计速度
-- 可选 450M、950M 或自定义的单条 TCP 连接上限，多设备不共享这个上限
-- 仅在高级模式下才使用 HTB/TBF 限制整台机器合计速度
+- 默认整机总出口限速（HTB + fq，HTB 不可用自动回退 TBF）：500M 线路 430/450 档，G口 850/900 档，一键切换
+- 把总出口压在线路标称值以下，避免 BBR 在跨境/共享线路上持续超发导致重传暴涨和断流
+- 可选不限速自适应与单条 TCP 连接上限，仅推荐丢包极少的干净直连线路
 - 询问到本地的大致延迟；不知道可直接使用默认值
 - 自定义单连接上限、整机上限或 RTT 时同步重算 TCP 参数
 - 使用独立 sysctl 文件，不覆盖 `/etc/sysctl.conf`
@@ -48,10 +48,10 @@ sudo netshape
 
 ### 一键无人值守安装
 
-多设备自适应、160ms RTT 示例：
+整机总出口 430M、160ms RTT 示例（500M 线路 Emby 稳定推荐）：
 
 ```bash
-curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install --non-interactive --mode adaptive --rtt 160
+curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install --non-interactive --rate 430 --rtt 160
 ```
 
 ### 本地文件安装
@@ -66,25 +66,24 @@ sudo ./netshape-manager.sh install
 向导会询问：
 
 1. 你本地连接 VPS 大约多少毫秒；不知道可直接回车；
-2. 使用多设备自适应、单连接上限，还是高级整机合计上限。
+2. 选择线路档位：500M 线路 430/450，G口 850/900，或自定义总出口；不限速自适应仅适合干净直连线路。
 
-无人值守安装示例：
+无人值守安装示例（500M 线路稳定档）：
 
 ```bash
 sudo ./netshape-manager.sh install \
   --non-interactive \
-  --mode adaptive \
-  --rtt 160 \
+  --rate 430 \
+  --rtt 160
 ```
 
-每条 TCP 连接最多 950 Mbps：
+G口线路稳定档：
 
 ```bash
 sudo ./netshape-manager.sh install \
   --non-interactive \
-  --mode perflow \
-  --rtt 160 \
-  --rate 950
+  --rate 850 \
+  --rtt 160
 ```
 
 指定非默认路由网卡时可加 `--iface eth0`。默认使用 IPv4 默认路由网卡，找不到时再尝试 IPv6 默认路由。
@@ -100,10 +99,13 @@ sudo netshape
 常用快捷命令：
 
 ```bash
-sudo netshape adaptive           # 推荐：多设备自适应，无整机总上限
-sudo netshape per-flow 450       # 每条 TCP 连接最多 450 Mbps
-sudo netshape per-flow 950       # 每条 TCP 连接最多 950 Mbps
-sudo netshape total 2300         # 高级：整台机器合计最多 2300 Mbps
+sudo netshape 430                # Emby/多用户稳定（500M 线路推荐）
+sudo netshape 450                # 500M 线路速度优先
+sudo netshape 850                # G口稳定
+sudo netshape 900                # G口速度优先
+sudo netshape total 2300         # 自定义整机总出口
+sudo netshape adaptive           # 不限速自适应（仅干净直连线路）
+sudo netshape per-flow 450       # 高级：每条 TCP 连接上限 450 Mbps
 sudo netshape rtt 160            # 更新到本地的大致延迟
 sudo netshape status
 sudo netshape diagnose
@@ -137,15 +139,15 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-这里的“不限流”指 Nginx 不对单个 Emby 请求设置应用层速率上限。默认自适应模式也不限制整机总速度；每台设备的 TCP 连接由 BBR 分别适应自己的网络。脚本不会自动修改现有站点，因为不同面板和反代模板的结构差异很大。
+这里的“不限流”指 Nginx 不对单个 Emby 请求设置应用层速率上限；整机总出口档位仍然生效，它保护的是线路不被打爆，两者不冲突。脚本不会自动修改现有站点，因为不同面板和反代模板的结构差异很大。
 
 ## 调优原理
 
-### 1. 多设备独立适应
+### 1. 为什么默认限制整机总出口
 
-默认模式只使用 fq 做连接分离与 pacing，不设置总出口上限。BBR 在每条 TCP 连接上分别估计带宽和 RTT，因此不同运营商、不同 Wi-Fi/蜂窝网络的设备不会共同被锁死在 450M 或 950M。
+跨境和共享线路普遍存在强制限速（policing）与深度拥塞。BBR 不把丢包当作拥塞信号：不设上限时它会按探测到的峰值带宽持续超发，撞上 policer 后拥塞窗口和重传一起失控（实测 15 秒可产生十几万次重传），Emby 播放随之断流。把整机总出口固定在标称值以下（500M→430/450，1G→850/900），HTB 在源头平滑发送速率，fq 负责连接间公平排队与 pacing，重传立刻回到正常水平。
 
-`fq maxrate` 是单条流的上限，不是设备上限；一个播放器如果建立多条 TCP 连接，设备合计速度可能超过该数值。整机合计上限只适合明确需要避免打满物理端口的场景，属于高级功能。
+不限速自适应模式只适合丢包极少的干净直连线路；`fq maxrate` 单连接上限是高级选项，它限制的是每条流而不是每台设备。
 
 整形只控制服务器发出的流量。它不能修复上游拥塞、入口丢包、源站转码不足或客户端 Wi-Fi 问题。
 
@@ -155,10 +157,10 @@ sudo systemctl reload nginx
 
 ```text
 BDP(bytes) = rate(Mbps) × RTT(ms) × 125
-目标缓冲   = 2 × BDP
+目标缓冲   = 2 × BDP（按 1 MiB 取整）
 ```
 
-结果向上取 2 的幂，并按 RAM 档位限制在 8–128 MiB。TCP 自动调优按需增长缓冲，并不在每个连接建立时立即分配最大值。
+并按 RAM 档位限制在 8–128 MiB。缓冲刻意不取过大的整数倍：过大的缓冲会允许 BBR 在被限速的线路上囤积巨大的拥塞窗口，正是重传暴涨的来源之一。TCP 自动调优按需增长缓冲，并不在每个连接建立时立即分配最大值。
 
 脚本故意不写死 `net.ipv4.tcp_mem`。现代 Linux 会在启动时根据可用内存计算全局 TCP 内存阈值，固定复制其他机器的页数反而可能让小内存 VPS 过度分配，或让大内存机器过早进入内存压力。
 
@@ -177,15 +179,14 @@ sudo netshape diagnose
 
 重点观察：
 
-- 默认自适应模式是否显示普通 fq；
-- 若使用高级整机上限，队列是否为 HTB + fq 或 TBF + fq；
+- 队列是否为 HTB + fq 或 TBF + fq，class 的 rate/ceil 是否是你设置的档位；
 - qdisc/class 的 `dropped`、`overlimits` 是否持续快速增长；
 - TCP 重传计数是否在播放时快速增加；
 - Nginx error log 是否出现 upstream timeout、client prematurely closed；
 - Emby 是否正在转码，CPU、磁盘或源站上行是否成为瓶颈；
 - MTU/PMTU、隧道封装和跨境线路是否造成黑洞或持续丢包。
 
-若自适应模式仍断流，应检查对应客户端路径的丢包、MTU、Nginx/Emby 日志和转码负载；不要先用很低的整机总上限掩盖问题。只用一次测速结果不能证明流媒体长连接稳定。
+若当前档位仍断流或重传高，先降一档（450→430，900→850）观察，再排查客户端路径丢包、MTU、Nginx/Emby 日志和转码负载。只用一次测速结果不能证明流媒体长连接稳定。
 
 ## 开发自检
 

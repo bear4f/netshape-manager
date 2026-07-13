@@ -24,9 +24,10 @@ assert_eq 850 "$(recommended_rate 1000 stable)" '1G stable'
 assert_eq speed "$(default_profile_for_rtt 80)" '80ms profile'
 assert_eq balanced "$(default_profile_for_rtt 160)" '160ms profile'
 assert_eq stable "$(default_profile_for_rtt 220)" '220ms profile'
-assert_eq 33554432 "$(calculate_tcp_max 450 160 1024)" '450M 160ms 1GiB buffer'
-assert_eq 67108864 "$(calculate_tcp_max 950 160 2048)" '950M 160ms 2GiB buffer'
+assert_eq 18874368 "$(calculate_tcp_max 450 160 1024)" '450M 160ms 2xBDP buffer'
+assert_eq 38797312 "$(calculate_tcp_max 950 160 2048)" '950M 160ms 2xBDP buffer'
 assert_eq 8388608 "$(calculate_tcp_max 100 20 256)" 'small-memory floor/cap'
+assert_eq 33554432 "$(calculate_tcp_max 950 160 1024)" 'RAM tier caps buffer'
 assert_eq /proc/sys/net/ipv4/tcp_rmem "$(sysctl_path net.ipv4.tcp_rmem)" 'sysctl key path'
 assert_eq 550 "$(calculate_htb_burst_kb 450)" '450M HTB burst'
 assert_eq 1160 "$(calculate_htb_burst_kb 950)" '950M HTB burst'
@@ -41,13 +42,16 @@ render_test() {
   SHAPING="$1" LIMIT_MODE="$2" RATE_MBPS="$3" RTT_MS=160 SHAPER_MODE="$4"
   render_menu
 }
-menu_out="$(render_test on adaptive 950 fq)"
-[[ "$menu_out" == *'▸ 1) 多设备自适应'* ]] || { printf 'FAIL: adaptive menu marker\n' >&2; exit 1; }
+menu_out="$(render_test on total 430 htb)"
+[[ "$menu_out" == *'▸ 1) 430 Mbps'* ]] || { printf 'FAIL: total 430 menu marker\n' >&2; exit 1; }
+printf 'PASS: total 430 menu marker\n'
+menu_out="$(render_test on total 850 htb)"
+[[ "$menu_out" == *'▸ 3) 850 Mbps'* ]] || { printf 'FAIL: total 850 menu marker\n' >&2; exit 1; }
+printf 'PASS: total 850 menu marker\n'
+menu_out="$(render_test on adaptive 450 fq)"
+[[ "$menu_out" == *'▸ 6) 不限速自适应'* ]] || { printf 'FAIL: adaptive menu marker\n' >&2; exit 1; }
 printf 'PASS: adaptive menu marker\n'
-menu_out="$(render_test on perflow 450 fq)"
-[[ "$menu_out" == *'▸ 2) 单条 TCP 连接上限 450'* ]] || { printf 'FAIL: perflow 450 menu marker\n' >&2; exit 1; }
-printf 'PASS: perflow 450 menu marker\n'
-menu_out="$(render_test off adaptive 950 fq)"
+menu_out="$(render_test off total 430 htb)"
 [[ "$menu_out" == *'已暂停人为限速'* && "$menu_out" != *'▸ 1)'* ]] || { printf 'FAIL: paused menu state\n' >&2; exit 1; }
 printf 'PASS: paused menu state\n'
 

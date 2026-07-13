@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="3.1.1"
+VERSION="4.0.0"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -53,12 +53,6 @@ need_root() {
 has() { command -v "$1" >/dev/null 2>&1; }
 
 is_uint() { [[ ${1:-} =~ ^[0-9]+$ ]]; }
-
-round_up_power_of_two() {
-  local value="$1" result=1
-  while (( result < value )); do result=$((result * 2)); done
-  printf '%s\n' "$result"
-}
 
 detect_iface() {
   local iface=''
@@ -136,15 +130,17 @@ memory_buffer_cap() {
 }
 
 calculate_tcp_max() {
-  local rate="$1" rtt="$2" mem="$3" bdp target cap rounded
+  local rate="$1" rtt="$2" mem="$3" bdp target cap
   # Mbps * ms * 125 = bytes in one bandwidth-delay product.
   bdp=$((rate * rtt * 125))
+  # Exactly 2x BDP rounded to 1 MiB: oversized buffers let BBR hold a huge
+  # cwnd on policed cross-border links and retransmissions explode.
   target=$((bdp * 2))
   (( target < 8388608 )) && target=8388608
-  rounded="$(round_up_power_of_two "$target")"
+  target=$(( (target + 1048575) / 1048576 * 1048576 ))
   cap="$(memory_buffer_cap "$mem")"
-  (( rounded > cap )) && rounded="$cap"
-  printf '%s\n' "$rounded"
+  (( target > cap )) && target="$cap"
+  printf '%s\n' "$target"
 }
 
 calculate_htb_burst_kb() {
@@ -185,7 +181,7 @@ limit_mode_label() {
   case "${1:-}" in
     adaptive) printf '多设备自适应（不限制整机总速）\n' ;;
     perflow) printf '单条 TCP 连接上限\n' ;;
-    total) printf '整台机器合计上限（高级）\n' ;;
+    total) printf '整机总出口上限（推荐）\n' ;;
     *) printf '未知\n' ;;
   esac
 }
@@ -210,14 +206,14 @@ format_bytes() {
 }
 
 default_config() {
-  LINE_MBPS=1000
+  LINE_MBPS=500
   RTT_MS=160
   PROFILE="custom"
-  RATE_MBPS=950
+  RATE_MBPS=430
   SHAPING="on"
   IFACE="auto"
   SHAPER_MODE="auto"
-  LIMIT_MODE="adaptive"
+  LIMIT_MODE="total"
 }
 
 load_config() {
@@ -407,7 +403,7 @@ apply_shape() {
     restore_fq "$iface"
     SHAPER_MODE=fq
     save_config
-    log "已启用多设备自适应：不限制整机总速度，每条 TCP 连接独立适应自己的网络"
+    log "已启用不限速自适应：无整机总上限，每条 TCP 连接独立适应自己的网络"
     return 0
   fi
 
@@ -428,7 +424,7 @@ apply_shape() {
     die "当前 VPS 不支持单连接限速，已恢复不限速 fq。${detail:+ 内核返回：$detail}"
   fi
 
-  info "高级模式：正在设置整台机器合计上限 ${RATE_MBPS} Mbps（网卡 ${iface}）"
+  info "正在设置整机总出口上限 ${RATE_MBPS} Mbps（HTB/TBF + fq，网卡 ${iface}）"
 
   if [[ "$requested_mode" == auto || "$requested_mode" == htb ]]; then
     if try_htb_fq "$iface" "$RATE_MBPS" "$burst_kb" "$error_file"; then
@@ -476,8 +472,8 @@ set_profile() {
   load_config
   PROFILE="$profile"
   RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
-  LIMIT_MODE="perflow"
-  SHAPER_MODE="fq"
+  LIMIT_MODE="total"
+  SHAPER_MODE="auto"
   SHAPING="on"
   save_config
   apply_all
@@ -503,11 +499,14 @@ set_adaptive() {
   load_config
   LIMIT_MODE="adaptive"
   PROFILE="custom"
-  RATE_MBPS=950
+  # Keep the buffer basis conservative even without a shaper: oversized
+  # buffers are what let BBR overrun policed cross-border links.
+  RATE_MBPS=450
   SHAPING="on"
   SHAPER_MODE="fq"
   save_config
   apply_all
+  warn "不限速模式只适合干净直连线路；跨境/共享线路请优先使用整机总出口档位"
 }
 
 set_total_rate() {
@@ -678,6 +677,10 @@ diagnose() {
       systemctl is-enabled "$file" >/dev/null 2>&1 && printf '  可能冲突的服务：%s\n' "$file"
     done
   fi
+  if has nginx; then
+    printf '\n'
+    nginx_audit
+  fi
   printf '\n提示：播放器断流还应同时检查源站负载、丢包、MTU、反代日志和客户端缓冲。\n'
 }
 
@@ -704,45 +707,51 @@ wizard() {
   RTT_MS="$(prompt_uint '你本地连接这台 VPS 大约多少毫秒（不知道直接回车）' 160 1 3000)"
   printf '%s\n' \
     '' \
-    '请选择网络策略：' \
-    '  1) 多设备/不同网络自适应（推荐，不限制整机总速度）' \
-    '  2) 每条 TCP 连接最多 450 Mbps' \
-    '  3) 每条 TCP 连接最多 950 Mbps' \
-    '  4) 手动设置单条 TCP 连接上限' \
-    '  5) 高级：限制整台机器所有连接的合计速度'
+    '请选择线路档位（整机总出口限速，压在标称值以下换取低重传和不断流）：' \
+    '  1) 500M 线路：总出口 430 Mbps（Emby/多用户稳定，推荐）' \
+    '  2) 500M 线路：总出口 450 Mbps（速度优先）' \
+    '  3) G口/1G 线路：总出口 850 Mbps（稳定）' \
+    '  4) G口/1G 线路：总出口 900 Mbps（速度优先）' \
+    '  5) 自定义整机总出口上限' \
+    '  6) 不限速自适应（仅干净直连线路，跨境线路易大量重传）'
   read -r -p '请选择 [1]: ' answer
   case "${answer:-1}" in
     1)
-      LIMIT_MODE=adaptive
-      RATE_MBPS=950
-      LINE_MBPS=1000
-      SHAPER_MODE=fq
+      LIMIT_MODE=total
+      RATE_MBPS=430
+      LINE_MBPS=500
+      SHAPER_MODE=auto
       ;;
     2)
-      LIMIT_MODE=perflow
+      LIMIT_MODE=total
       RATE_MBPS=450
       LINE_MBPS=500
-      SHAPER_MODE=fq
+      SHAPER_MODE=auto
       ;;
     3)
-      LIMIT_MODE=perflow
-      RATE_MBPS=950
+      LIMIT_MODE=total
+      RATE_MBPS=850
       LINE_MBPS=1000
-      SHAPER_MODE=fq
+      SHAPER_MODE=auto
       ;;
     4)
-      custom="$(prompt_uint '每条 TCP 连接上限（Mbps）' 950 10 100000)"
-      LIMIT_MODE=perflow
-      RATE_MBPS="$custom"
-      LINE_MBPS="$custom"
-      SHAPER_MODE=fq
+      LIMIT_MODE=total
+      RATE_MBPS=900
+      LINE_MBPS=1000
+      SHAPER_MODE=auto
       ;;
     5)
-      custom="$(prompt_uint '整台机器所有连接合计上限（Mbps）' 2300 10 100000)"
+      custom="$(prompt_uint '整机总出口上限（Mbps）' 430 10 100000)"
       LIMIT_MODE=total
       RATE_MBPS="$custom"
       LINE_MBPS="$custom"
       SHAPER_MODE=auto
+      ;;
+    6)
+      LIMIT_MODE=adaptive
+      RATE_MBPS=450
+      LINE_MBPS=500
+      SHAPER_MODE=fq
       ;;
     *) die "无效选项" ;;
   esac
@@ -833,7 +842,8 @@ parse_install_args() {
   [[ "$IFACE" == auto || "$IFACE" =~ ^[a-zA-Z0-9_.:-]+$ ]] || die "无效 --iface"
   if [[ "$PROFILE" != custom ]]; then
     RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
-    LIMIT_MODE=perflow
+    LIMIT_MODE=total
+    SHAPER_MODE=auto
   fi
   is_uint "$RATE_MBPS" || die "无效 --rate"
   SHAPING=on
@@ -861,25 +871,26 @@ uninstall_all() {
 
 render_menu() {
   local current_text queue_text
-  local m1=' ' m2=' ' m3=' ' m4=' ' m5=' '
+  local m1=' ' m2=' ' m3=' ' m4=' ' m5=' ' m6=' '
   if [[ "$SHAPING" == off ]]; then
     current_text="${YELLOW}已暂停人为限速${RESET}（netshape apply 可恢复）"
   else
     case "$LIMIT_MODE" in
-      adaptive) current_text='多设备自适应，不限制整机总速度' ;;
+      adaptive) current_text='不限速自适应（无整机总上限）' ;;
       perflow) current_text="每条 TCP 连接最多 ${RATE_MBPS} Mbps" ;;
-      total) current_text="整台机器合计最多 ${RATE_MBPS} Mbps" ;;
+      total) current_text="整机总出口 ${RATE_MBPS} Mbps" ;;
     esac
     case "$LIMIT_MODE" in
-      adaptive) m1='▸' ;;
-      perflow)
+      adaptive) m6='▸' ;;
+      total)
         case "$RATE_MBPS" in
+          430) m1='▸' ;;
           450) m2='▸' ;;
-          950) m3='▸' ;;
-          *) m4='▸' ;;
+          850) m3='▸' ;;
+          900) m4='▸' ;;
+          *) m5='▸' ;;
         esac
         ;;
-      total) m5='▸' ;;
     esac
   fi
   queue_text="$(queue_label "$SHAPING" "$LIMIT_MODE" "$SHAPER_MODE")"
@@ -888,16 +899,16 @@ render_menu() {
   printf '  %b延迟参考%b  %s ms\n' "$DIM" "$RESET" "$RTT_MS"
   printf '  %b队列模式%b  %s\n' "$DIM" "$RESET" "$queue_text"
   rule_light
-  printf '  %b网络策略%b        %b▸ 为当前生效项%b\n' "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '  %b%s%b %b1)%b 多设备自适应（推荐，各设备跑满自己的网络）\n' "$GREEN" "$m1" "$RESET" "$BOLD" "$RESET"
-  printf '  %b%s%b %b2)%b 单条 TCP 连接上限 450 Mbps（适合 500M 线路）\n' "$GREEN" "$m2" "$RESET" "$BOLD" "$RESET"
-  printf '  %b%s%b %b3)%b 单条 TCP 连接上限 950 Mbps（适合 1G 线路）\n' "$GREEN" "$m3" "$RESET" "$BOLD" "$RESET"
-  printf '  %b%s%b %b4)%b 自定义单条 TCP 连接上限\n' "$GREEN" "$m4" "$RESET" "$BOLD" "$RESET"
-  printf '  %b%s%b %b5)%b 高级：整台机器合计上限\n' "$GREEN" "$m5" "$RESET" "$BOLD" "$RESET"
+  printf '  %b限速档位（整机总出口）%b  %b▸ 为当前生效项%b\n' "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '  %b%s%b %b1)%b 430 Mbps —— Emby/多用户稳定（500M 线路推荐）\n' "$GREEN" "$m1" "$RESET" "$BOLD" "$RESET"
+  printf '  %b%s%b %b2)%b 450 Mbps —— 500M 线路速度优先\n' "$GREEN" "$m2" "$RESET" "$BOLD" "$RESET"
+  printf '  %b%s%b %b3)%b 850 Mbps —— G口稳定\n' "$GREEN" "$m3" "$RESET" "$BOLD" "$RESET"
+  printf '  %b%s%b %b4)%b 900 Mbps —— G口速度优先\n' "$GREEN" "$m4" "$RESET" "$BOLD" "$RESET"
+  printf '  %b%s%b %b5)%b 自定义整机总出口上限\n' "$GREEN" "$m5" "$RESET" "$BOLD" "$RESET"
+  printf '  %b%s%b %b6)%b 不限速自适应%b（仅干净直连线路）%b\n' "$GREEN" "$m6" "$RESET" "$BOLD" "$RESET" "$DIM" "$RESET"
   printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
-  printf '    %b6)%b 查看状态与重传\n' "$BOLD" "$RESET"
-  printf '    %b7)%b 诊断冲突\n' "$BOLD" "$RESET"
-  printf '    %b8)%b Nginx/Emby 不限流片段与审计%b（仅本机自建反代时需要）%b\n' "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '    %b7)%b 查看状态与重传\n' "$BOLD" "$RESET"
+  printf '    %b8)%b 诊断冲突与 Nginx 审计\n' "$BOLD" "$RESET"
   printf '    %b9)%b 修改到本地的大致延迟\n' "$BOLD" "$RESET"
   printf '    %b0)%b 退出\n' "$BOLD" "$RESET"
   rule_light
@@ -911,14 +922,14 @@ menu() {
     render_menu
     read -r -p '  请选择 [0-9]: ' answer
     case "$answer" in
-      1) set_adaptive ;;
-      2) set_rate 450 ;;
-      3) set_rate 950 ;;
-      4) set_rate "$(prompt_uint '每条 TCP 连接上限（Mbps）' "$RATE_MBPS" 10 100000)" ;;
-      5) set_total_rate "$(prompt_uint '整台机器所有设备合计上限（Mbps）' 2300 10 100000)" ;;
-      6) show_status ;;
-      7) diagnose ;;
-      8) write_nginx_snippet; nginx_audit ;;
+      1) set_total_rate 430 ;;
+      2) set_total_rate 450 ;;
+      3) set_total_rate 850 ;;
+      4) set_total_rate 900 ;;
+      5) set_total_rate "$(prompt_uint '整机总出口上限（Mbps）' "$RATE_MBPS" 10 100000)" ;;
+      6) set_adaptive ;;
+      7) show_status ;;
+      8) diagnose ;;
       9) set_rtt "$(prompt_uint '你本地连接这台 VPS 大约多少毫秒' "$RTT_MS" 1 3000)" ;;
       0) return ;;
       *) warn "无效选项" ;;
@@ -928,30 +939,33 @@ menu() {
 
 usage() {
   cat <<'EOF'
-NetShape Manager - 多设备/多网络 TCP 自适应 SSH 面板
+NetShape Manager - 整机总出口限速 + fq 公平排队 SSH 面板
 
 首次安装：
   sudo bash netshape-manager.sh install
-  sudo bash netshape-manager.sh install --non-interactive --mode adaptive --rtt 160
+  sudo bash netshape-manager.sh install --non-interactive --rate 430 --rtt 160
 
 安装后：
   netshape                 打开 SSH 交互面板
-  netshape adaptive        多设备自适应，不限制整机总速度
-  netshape per-flow 450    每条 TCP 连接最多 450 Mbps
-  netshape per-flow 950    每条 TCP 连接最多 950 Mbps
-  netshape total 2300      高级：整台机器合计最多 2300 Mbps
-  netshape rate 470        per-flow 470 的兼容简写
-  netshape rtt 160         更新 RTT 并重算
-  netshape 450             per-flow 450 的简写
-  netshape off             取消人为限速，恢复 fq
+  netshape 430             整机总出口 430M（Emby/多用户稳定，500M 线路推荐）
+  netshape 450             整机总出口 450M（500M 线路速度优先）
+  netshape 850             整机总出口 850M（G口稳定）
+  netshape 900             整机总出口 900M（G口速度优先）
+  netshape total 2300      自定义整机总出口
+  netshape adaptive        不限速自适应（仅干净直连线路）
+  netshape per-flow 450    高级：每条 TCP 连接上限 450M
+  netshape rtt 160         更新 RTT 并重算 TCP 缓冲
+  netshape off             暂停限速，保留 fq
   netshape apply           重新应用持久化配置
   netshape status          查看机器、TCP、qdisc、class 和重传
-  netshape diagnose        检查重复 sysctl/旧服务
-  netshape nginx-snippet   生成 Emby 不限流片段
+  netshape diagnose        检查重复 sysctl/旧服务并审计 Nginx
+  netshape nginx-snippet   生成 Emby 不限流片段（本机自建反代时用）
   netshape nginx-audit     只读审计 Nginx 限速项
   netshape uninstall       卸载自身
 
-说明：默认不限制整机总速度。BBR 与 fq 会让不同设备的 TCP 连接各自适应网络。
+说明：跨境/共享线路上不限速的 BBR 容易持续超发、重传暴涨。
+默认把整机总出口压在线路标称值以下（500M→430/450，1G→850/900），
+HTB 平滑总出口，fq 公平排队，换取低重传和 Emby 不断流。
 EOF
 }
 
@@ -964,7 +978,7 @@ main() {
     per-flow) set_rate "${2:-}" ;;
     total) set_total_rate "${2:-}" ;;
     profile) set_profile "${2:-}" ;;
-    rate) set_rate "${2:-}" ;;
+    rate) set_total_rate "${2:-}" ;;
     line) set_line "${2:-}" ;;
     rtt) set_rtt "${2:-}" ;;
     off) set_off ;;
@@ -977,7 +991,7 @@ main() {
     help|-h|--help) usage ;;
     version|--version) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     *)
-      if is_uint "$command"; then set_rate "$command"; else die "未知命令：${command}（用 --help 查看帮助）"; fi
+      if is_uint "$command"; then set_total_rate "$command"; else die "未知命令：${command}（用 --help 查看帮助）"; fi
       ;;
   esac
 }
