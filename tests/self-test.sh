@@ -32,6 +32,7 @@ assert_eq 550 "$(calculate_htb_burst_kb 450)" '450M HTB burst'
 assert_eq 1160 "$(calculate_htb_burst_kb 950)" '950M HTB burst'
 assert_eq '推荐均衡' "$(profile_label balanced)" 'Chinese profile label'
 assert_eq '自动检测' "$(shaper_label auto)" 'Chinese shaper label'
+assert_eq '多设备自适应（不限制整机总速）' "$(limit_mode_label adaptive)" 'adaptive mode label'
 
 tc_log="$(mktemp)"
 need_root() { :; }
@@ -40,6 +41,7 @@ load_config() {
   RATE_MBPS=900
   SHAPING=on
   SHAPER_MODE=auto
+  LIMIT_MODE="${TEST_LIMIT_MODE:-total}"
   LINE_MBPS=1000
   RTT_MS=160
   PROFILE=balanced
@@ -70,6 +72,13 @@ TC_REJECT_HTB=1
 apply_shape >/dev/null 2>&1
 assert_eq 'qdisc add dev eth-test root handle 1: tbf rate 900mbit burst 1099kb latency 50ms' "$(sed -n '4p' "$tc_log")" 'fallback to TBF root'
 assert_eq tbf "$SHAPER_MODE" 'remember compatible shaper'
+
+: > "$tc_log"
+unset TC_REJECT_HTB
+TEST_LIMIT_MODE=adaptive
+apply_shape >/dev/null
+assert_eq 'qdisc replace dev eth-test root fq' "$(sed -n '2p' "$tc_log")" 'adaptive mode uses unlimited fq'
+assert_eq fq "$SHAPER_MODE" 'adaptive mode records fq'
 rm -f "$tc_log"
 
 printf '%s\n' 'All self-tests passed.'
