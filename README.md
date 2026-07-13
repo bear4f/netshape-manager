@@ -1,6 +1,6 @@
 # NetShape Manager
 
-面向 Linux 中转机、Emby/Jellyfin 反代和高 RTT 链路的 SSH 交互式网络调优工具。它会根据线路带宽、线路机到本地的 RTT、机器内存和内核能力，生成保守的 TCP 参数，并用 **HTB + fq** 控制整机出口，避免多连接同时打满线路后出现排队、重传和播放断流。
+面向 Linux 中转机、Emby/Jellyfin 反代和高 RTT 链路的 SSH 交互式网络调优工具。它会根据你选择的简单方案、到本地的大致延迟、机器内存和内核能力生成保守的 TCP 参数，并自动选择 VPS 支持的限速队列，减少排队、重传和播放断流。
 
 > 本项目不会上传硬件、IP、域名或运行数据，也不包含作者或使用者的个人信息。
 
@@ -8,14 +8,10 @@
 
 - SSH 中文交互面板；安装后直接运行 `netshape`
 - 自动识别 CPU、RAM、Swap、默认出口网卡、MTU、内核和 BBR 支持
-- 询问“线路机到本地 RTT”，按带宽时延积（BDP）和内存档位计算 TCP 缓冲上限
-- 内置 500M 与 1G 常用档位：
-
-  | 档位 | 500M 线路 | 1G 线路 | 适用方向 |
-  |---|---:|---:|---|
-  | speed | 450M | 950M | 低 RTT、线路质量好 |
-  | balanced | 430M | 900M | 中高 RTT、日常推荐 |
-  | stable | 400M | 850M | 高丢包或稳定优先 |
+- 不知道 VPS 套餐带宽也能安装，向导提供“不知道 / 约500M / 约1G / 自定义”选择
+- 面板只显示三个直观方案：速度优先、推荐均衡、稳定优先，并显示将要采用的具体上限
+- 询问到本地的大致延迟；不知道可直接使用默认值
+- 优先使用 HTB + fq；不兼容时自动尝试 TBF + fq，最后才回退 fq maxrate
 
 - 自定义线路或限速时，同步重算 TCP 参数
 - 使用独立 sysctl 文件，不覆盖 `/etc/sysctl.conf`
@@ -70,9 +66,9 @@ sudo ./netshape-manager.sh install
 
 向导会询问：
 
-1. 线路标称带宽，例如 `500` 或 `1000` Mbps；
-2. 线路机到本地的往返延迟 RTT，例如 `160` ms；
-3. 是否接受推荐档位，或改用自定义总出口。
+1. 是否知道 VPS 套餐写的端口速度；不知道可直接选择默认项；
+2. 你本地连接 VPS 大约多少毫秒；不知道可直接回车；
+3. 使用推荐方案，还是速度优先、稳定优先或手动上限。
 
 无人值守安装示例：
 
@@ -107,16 +103,16 @@ sudo netshape
 常用快捷命令：
 
 ```bash
-sudo netshape profile speed      # 500M→450M，1G→950M
-sudo netshape profile balanced   # 500M→430M，1G→900M
-sudo netshape profile stable     # 500M→400M，1G→850M
+sudo netshape profile speed      # 速度优先
+sudo netshape profile balanced   # 推荐均衡
+sudo netshape profile stable     # 稳定优先
 sudo netshape rate 470           # 自定义 470M，并同步 TCP 参数
 sudo netshape rtt 160            # 更新 RTT，重新推荐并应用
-sudo netshape line 1000          # 更新线路带宽并重算
+sudo netshape line 1000          # 高级：更新计算参考速度
 sudo netshape 450                # netshape rate 450 的简写
 sudo netshape status
 sudo netshape diagnose
-sudo netshape off                # 暂停 HTB，保留 fq/fq_codel
+sudo netshape off                # 暂停限速，保留 fq/fq_codel
 sudo netshape apply              # 恢复持久化配置
 ```
 
@@ -144,13 +140,13 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-这里的“不限流”指 Nginx 不对单个 Emby 请求设置应用层速率上限。NetShape 的 HTB 仍然限制整台机器的总出口，这是防止多用户共同打满物理线路的关键。脚本不会自动修改现有站点，因为不同面板和反代模板的结构差异很大。
+这里的“不限流”指 Nginx 不对单个 Emby 请求设置应用层速率上限。NetShape 仍会保护服务器出口，避免多用户共同打满线路。脚本不会自动修改现有站点，因为不同面板和反代模板的结构差异很大。
 
 ## 调优原理
 
 ### 1. 总出口保护
 
-根队列使用 HTB 控制整机总出口，子队列使用 fq 对 TCP 流公平排队。450M/950M 不是单个用户的上限，而是同一出口网卡上所有连接共享的上限。
+脚本优先使用 HTB + fq 控制整机总出口并公平排队。如果 VPS 内核拒绝 HTB，会自动尝试兼容性更好的 TBF + fq。两者都不可用时才退回 fq maxrate；该最后回退模式限制单个连接，面板会明确提醒它不保证整机合计上限。
 
 整形只控制服务器发出的流量。它不能修复上游拥塞、入口丢包、源站转码不足或客户端 Wi-Fi 问题。
 
@@ -182,14 +178,15 @@ sudo netshape diagnose
 
 重点观察：
 
-- HTB class 的 `rate/ceil` 是否为预期值；
+- 面板显示的队列模式是否为 HTB + fq 或 TBF + fq；
+- qdisc/class 的速率是否为预期值；
 - qdisc/class 的 `dropped`、`overlimits` 是否持续快速增长；
 - TCP 重传计数是否在播放时快速增加；
 - Nginx error log 是否出现 upstream timeout、client prematurely closed；
 - Emby 是否正在转码，CPU、磁盘或源站上行是否成为瓶颈；
 - MTU/PMTU、隧道封装和跨境线路是否造成黑洞或持续丢包。
 
-若 450M/950M 仍断流，先切到 `balanced`；若重传仍持续增长，再切到 `stable`。只用一次测速结果不能证明流媒体长连接稳定。
+若速度优先方案仍断流，先切到“推荐均衡”；若重传仍持续增长，再切到“稳定优先”。只用一次测速结果不能证明流媒体长连接稳定。
 
 ## 开发自检
 
