@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="4.0.0"
+VERSION="4.1.0"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -112,6 +112,19 @@ recommended_rate() {
   fi
   (( rate < 10 )) && rate=10
   printf '%s\n' "$rate"
+}
+
+tcp_mem_values() {
+  # Global TCP memory in 4 KiB pages, scaled by RAM. The 1-4 GiB tier
+  # uses field-proven values from a stable 2 GiB relay host.
+  local mem="$1"
+  if (( mem < 1024 )); then
+    printf '32768 49152 98304\n'
+  elif (( mem < 4096 )); then
+    printf '65536 98304 196608\n'
+  else
+    printf '131072 196608 393216\n'
+  fi
 }
 
 memory_buffer_cap() {
@@ -284,12 +297,14 @@ choose_congestion_control() {
 write_sysctl_profile() {
   need_root "$@"
   load_config
-  local mem tcp_max backlog notsent cc temp
+  local mem tcp_max backlog notsent cc temp min_free tcpmem
   mem="$(mem_total_mb)"
   (( mem > 0 )) || mem=1024
   tcp_max="$(calculate_tcp_max "$RATE_MBPS" "$RTT_MS" "$mem")"
   if (( mem < 1024 )); then backlog=4096; else backlog=16384; fi
+  if (( mem < 1024 )); then min_free=32768; else min_free=65536; fi
   if (( RTT_MS >= 120 )); then notsent=16384; else notsent=32768; fi
+  tcpmem="$(tcp_mem_values "$mem")"
   has modprobe && modprobe sch_fq >/dev/null 2>&1 || true
   cc="$(choose_congestion_control)"
 
@@ -301,27 +316,40 @@ write_sysctl_profile() {
   } > "$temp"
 
   append_sysctl "$temp" vm.swappiness 10
+  append_sysctl "$temp" vm.min_free_kbytes "$min_free"
+  append_sysctl "$temp" kernel.panic 10
   append_sysctl "$temp" net.core.default_qdisc fq
   append_sysctl "$temp" net.ipv4.tcp_congestion_control "$cc"
-  append_sysctl "$temp" net.core.somaxconn 4096
+  append_sysctl "$temp" net.core.somaxconn 2048
   append_sysctl "$temp" net.core.netdev_max_backlog "$backlog"
-  append_sysctl "$temp" net.ipv4.tcp_max_syn_backlog 4096
+  append_sysctl "$temp" net.ipv4.tcp_max_syn_backlog 2048
   append_sysctl "$temp" net.ipv4.tcp_syncookies 1
   append_sysctl "$temp" net.ipv4.tcp_window_scaling 1
   append_sysctl "$temp" net.ipv4.tcp_sack 1
   append_sysctl "$temp" net.ipv4.tcp_dsack 1
   append_sysctl "$temp" net.ipv4.tcp_timestamps 1
+  append_sysctl "$temp" net.ipv4.tcp_no_metrics_save 1
   append_sysctl "$temp" net.ipv4.tcp_moderate_rcvbuf 1
   append_sysctl "$temp" net.core.rmem_default 262144
   append_sysctl "$temp" net.core.wmem_default 262144
   append_sysctl "$temp" net.core.rmem_max "$tcp_max"
   append_sysctl "$temp" net.core.wmem_max "$tcp_max"
   append_sysctl "$temp" net.core.optmem_max 4194304
-  append_sysctl "$temp" net.ipv4.tcp_rmem "4096 262144 $tcp_max"
+  # Modest defaults so video seeks do not burst; max grows via autotuning.
+  append_sysctl "$temp" net.ipv4.tcp_rmem "4096 87380 $tcp_max"
   append_sysctl "$temp" net.ipv4.tcp_wmem "4096 65536 $tcp_max"
+  append_sysctl "$temp" net.ipv4.tcp_mem "$tcpmem"
+  append_sysctl "$temp" net.ipv4.tcp_adv_win_scale 1
   append_sysctl "$temp" net.ipv4.tcp_notsent_lowat "$notsent"
   append_sysctl "$temp" net.ipv4.tcp_mtu_probing 1
+  # Cross-border middleboxes: ECN / F-RTO / TCP Fast Open cause blackholes.
+  append_sysctl "$temp" net.ipv4.tcp_ecn 0
+  append_sysctl "$temp" net.ipv4.tcp_frto 0
+  append_sysctl "$temp" net.ipv4.tcp_fastopen 0
+  append_sysctl "$temp" net.ipv4.tcp_fastopen_blackhole_timeout_sec 0
   append_sysctl "$temp" net.ipv4.tcp_slow_start_after_idle 0
+  append_sysctl "$temp" net.ipv4.tcp_tw_reuse 1
+  append_sysctl "$temp" net.ipv4.tcp_fin_timeout 15
   append_sysctl "$temp" net.ipv4.tcp_keepalive_time 600
   append_sysctl "$temp" net.ipv4.tcp_keepalive_intvl 60
   append_sysctl "$temp" net.ipv4.tcp_keepalive_probes 5
@@ -684,6 +712,13 @@ diagnose() {
   printf '\n提示：播放器断流还应同时检查源站负载、丢包、MTU、反代日志和客户端缓冲。\n'
 }
 
+confirm_adaptive() {
+  local reply
+  [[ -t 0 ]] || return 0
+  read -r -p '不限速模式在跨境/共享线路上会大量重传甚至断流，确定使用？[y/N]: ' reply
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
 prompt_uint() {
   local prompt="$1" default="$2" min="$3" max="$4" value
   while true; do
@@ -748,10 +783,18 @@ wizard() {
       SHAPER_MODE=auto
       ;;
     6)
-      LIMIT_MODE=adaptive
-      RATE_MBPS=450
-      LINE_MBPS=500
-      SHAPER_MODE=fq
+      if confirm_adaptive; then
+        LIMIT_MODE=adaptive
+        RATE_MBPS=450
+        LINE_MBPS=500
+        SHAPER_MODE=fq
+      else
+        info "已改用默认 430 Mbps 稳定档"
+        LIMIT_MODE=total
+        RATE_MBPS=430
+        LINE_MBPS=500
+        SHAPER_MODE=auto
+      fi
       ;;
     *) die "无效选项" ;;
   esac
@@ -927,7 +970,7 @@ menu() {
       3) set_total_rate 850 ;;
       4) set_total_rate 900 ;;
       5) set_total_rate "$(prompt_uint '整机总出口上限（Mbps）' "$RATE_MBPS" 10 100000)" ;;
-      6) set_adaptive ;;
+      6) if confirm_adaptive; then set_adaptive; else warn "已取消，保持当前策略"; fi ;;
       7) show_status ;;
       8) diagnose ;;
       9) set_rtt "$(prompt_uint '你本地连接这台 VPS 大约多少毫秒' "$RTT_MS" 1 3000)" ;;
