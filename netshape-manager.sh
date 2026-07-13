@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="2.1.0"
+VERSION="3.0.0"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -161,6 +161,15 @@ shaper_label() {
   esac
 }
 
+limit_mode_label() {
+  case "${1:-}" in
+    adaptive) printf '多设备自适应（不限制整机总速）\n' ;;
+    perflow) printf '单条 TCP 连接上限\n' ;;
+    total) printf '整台机器合计上限（高级）\n' ;;
+    *) printf '未知\n' ;;
+  esac
+}
+
 line_reference_label() {
   case "${1:-}" in
     500) printf '不知道/约 500 Mbps\n' ;;
@@ -181,13 +190,14 @@ format_bytes() {
 }
 
 default_config() {
-  LINE_MBPS=500
+  LINE_MBPS=1000
   RTT_MS=160
-  PROFILE="balanced"
-  RATE_MBPS=430
+  PROFILE="custom"
+  RATE_MBPS=950
   SHAPING="on"
   IFACE="auto"
   SHAPER_MODE="auto"
+  LIMIT_MODE="adaptive"
 }
 
 load_config() {
@@ -203,6 +213,7 @@ load_config() {
       SHAPING) [[ "$value" =~ ^(on|off)$ ]] && SHAPING="$value" ;;
       IFACE) [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
       SHAPER_MODE) [[ "$value" =~ ^(auto|htb|tbf|fq)$ ]] && SHAPER_MODE="$value" ;;
+      LIMIT_MODE) [[ "$value" =~ ^(adaptive|perflow|total)$ ]] && LIMIT_MODE="$value" ;;
     esac
   done < "$CONFIG_FILE"
 }
@@ -221,6 +232,7 @@ save_config() {
     printf 'SHAPING=%s\n' "$SHAPING"
     printf 'IFACE=%s\n' "$IFACE"
     printf 'SHAPER_MODE=%s\n' "$SHAPER_MODE"
+    printf 'LIMIT_MODE=%s\n' "$LIMIT_MODE"
   } > "$temp"
   mv -f "$temp" "$CONFIG_FILE"
 }
@@ -365,13 +377,38 @@ apply_shape() {
 
   if [[ "$SHAPING" == off ]]; then
     restore_fq "$iface"
-    log "已关闭总出口限速，并恢复 fq/fq_codel：$iface"
+    log "已取消人为限速，并恢复连接公平排队：$iface"
     return 0
   fi
 
   (( RATE_MBPS >= 10 && RATE_MBPS <= 100000 )) || die "无效限速：${RATE_MBPS}Mbps"
-  info "正在设置整台机器总出口上限：${RATE_MBPS} Mbps（网卡 ${iface}）"
+
+  if [[ "$LIMIT_MODE" == adaptive ]]; then
+    restore_fq "$iface"
+    SHAPER_MODE=fq
+    save_config
+    log "已启用多设备自适应：不限制整机总速度，每条 TCP 连接独立适应自己的网络"
+    return 0
+  fi
+
   error_file="$(mktemp)"
+
+  if [[ "$LIMIT_MODE" == perflow ]]; then
+    info "正在设置单条 TCP 连接上限：${RATE_MBPS} Mbps（不会限制所有设备合计速度）"
+    if try_fq_maxrate "$iface" "$RATE_MBPS" "$error_file"; then
+      SHAPER_MODE=fq
+      save_config
+      rm -f "$error_file"
+      log "已启用 fq maxrate：每条 TCP 连接最多 ${RATE_MBPS} Mbps，多设备可同时使用"
+      return 0
+    fi
+    detail="$(tail -n 1 "$error_file" 2>/dev/null || true)"
+    rm -f "$error_file"
+    restore_fq "$iface"
+    die "当前 VPS 不支持单连接限速，已恢复不限速 fq。${detail:+ 内核返回：$detail}"
+  fi
+
+  info "高级模式：正在设置整台机器合计上限 ${RATE_MBPS} Mbps（网卡 ${iface}）"
 
   if [[ "$requested_mode" == auto || "$requested_mode" == htb ]]; then
     if try_htb_fq "$iface" "$RATE_MBPS" "$burst_kb" "$error_file"; then
@@ -386,16 +423,10 @@ apply_shape() {
   fi
 
   if [[ -z "$selected_mode" ]]; then
-    if try_fq_maxrate "$iface" "$RATE_MBPS" "$error_file"; then
-      selected_mode=fq
-    fi
-  fi
-
-  if [[ -z "$selected_mode" ]]; then
     detail="$(tail -n 1 "$error_file" 2>/dev/null || true)"
     rm -f "$error_file"
     restore_fq "$iface"
-    die "当前 VPS 不允许创建可用的限速队列，已恢复普通 fq。${detail:+ 内核返回：$detail}"
+    die "当前 VPS 不支持整机合计限速，已恢复不限速 fq。${detail:+ 内核返回：$detail}"
   fi
   rm -f "$error_file"
 
@@ -409,9 +440,6 @@ apply_shape() {
     tbf)
       warn "本机不支持 HTB，已自动切换到兼容模式 TBF + fq"
       log "整台机器所有连接合计不超过 ${RATE_MBPS} Mbps"
-      ;;
-    fq)
-      warn "本机不支持整机队列，已使用 fq maxrate；该模式限制单个连接，不保证整机合计上限"
       ;;
   esac
 }
@@ -428,6 +456,8 @@ set_profile() {
   load_config
   PROFILE="$profile"
   RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
+  LIMIT_MODE="perflow"
+  SHAPER_MODE="fq"
   SHAPING="on"
   save_config
   apply_all
@@ -441,7 +471,36 @@ set_rate() {
   load_config
   RATE_MBPS="$rate"
   PROFILE="custom"
+  LIMIT_MODE="perflow"
+  SHAPER_MODE="fq"
   SHAPING="on"
+  save_config
+  apply_all
+}
+
+set_adaptive() {
+  need_root "$@"
+  load_config
+  LIMIT_MODE="adaptive"
+  PROFILE="custom"
+  RATE_MBPS=950
+  SHAPING="on"
+  SHAPER_MODE="fq"
+  save_config
+  apply_all
+}
+
+set_total_rate() {
+  local rate="${1:-}"
+  is_uint "$rate" || die "整机合计上限必须是整数 Mbps，例如 2300"
+  (( rate >= 10 && rate <= 100000 )) || die "速率范围为 10-100000 Mbps"
+  need_root "$@"
+  load_config
+  RATE_MBPS="$rate"
+  PROFILE="custom"
+  LIMIT_MODE="total"
+  SHAPING="on"
+  SHAPER_MODE="auto"
   save_config
   apply_all
 }
@@ -512,7 +571,7 @@ write_nginx_snippet() {
   chmod 0644 "$NGINX_SNIPPET"
   log "已生成 Nginx 片段：$NGINX_SNIPPET"
   info "请在 Emby 的 location 块中加入：include $NGINX_SNIPPET;"
-  info "该片段取消 Nginx 单请求限速；线路总出口仍由 NetShape 保护。"
+  info "该片段取消 Nginx 单请求限速；TCP 调度由 NetShape 处理。"
 }
 
 nginx_audit() {
@@ -549,10 +608,13 @@ show_status() {
   printf '  系统:      %s\n' "$(uname -srmo 2>/dev/null || uname -a)"
   printf '  CPU/RAM:   %s vCPU / %s MB RAM / %s MB Swap\n' "$(cpu_count)" "$mem" "$swap"
   printf '  网卡:      %s\n' "${iface:-未检测到}"
-  printf '  带宽参考:  %s\n' "$(line_reference_label "$LINE_MBPS")"
   printf '  延迟参考:  %s ms\n' "$RTT_MS"
-  printf '  当前方案:  %s\n' "$(profile_label "$PROFILE")"
-  printf '  总出口:    %s / %s Mbps（整台机器合计）\n' "$SHAPING" "$RATE_MBPS"
+  printf '  网络策略:  %s\n' "$(limit_mode_label "$LIMIT_MODE")"
+  case "$LIMIT_MODE" in
+    adaptive) printf '  限速状态:  不限制整机总速度\n' ;;
+    perflow) printf '  限速状态:  每条 TCP 连接最多 %s Mbps\n' "$RATE_MBPS" ;;
+    total) printf '  限速状态:  整台机器所有连接合计 %s Mbps\n' "$RATE_MBPS" ;;
+  esac
   printf '  队列模式:  %s\n' "$(shaper_label "$SHAPER_MODE")"
   printf '  TCP:       %s + %s / 缓冲建议 %s\n' "$cc" "$qdisc" "$(format_bytes "$tcp_max")"
   if [[ -n "$iface" ]] && has ip; then
@@ -603,66 +665,59 @@ prompt_uint() {
   done
 }
 
-prompt_line_reference() {
-  local answer custom
-  while true; do
-    printf '%s\n' \
-      '' \
-      '请选择最接近的情况（这里只用于计算安全余量）：' \
-      '  1) 不知道/不确定（推荐，先按常见 500M 计算）' \
-      '  2) 套餐或服务商写着约 500 Mbps' \
-      '  3) 套餐或服务商写着约 1 Gbps' \
-      '  4) 我知道具体数值' >&2
-    read -r -p '请选择 [1]: ' answer
-    case "${answer:-1}" in
-      1) printf '500\n'; return ;;
-      2) printf '500\n'; return ;;
-      3) printf '1000\n'; return ;;
-      4)
-        custom="$(prompt_uint '请输入服务商标注的 Mbps 数值' 500 10 100000)"
-        printf '%s\n' "$custom"
-        return
-        ;;
-      *) warn "请输入 1、2、3 或 4" ;;
-    esac
-  done
-}
-
 wizard() {
   need_root "$@"
   [[ -t 0 ]] || die "交互向导需要终端；自动安装请使用 install --line 500 --rtt 160"
-  local mem swap suggested answer custom
+  local mem swap answer custom
   mem="$(mem_total_mb)"; swap="$(swap_total_mb)"
   printf '%bNetShape 自适应安装向导%b\n' "$BOLD" "$RESET"
   printf '检测到：%s vCPU，%s MB RAM，%s MB Swap，网卡 %s\n\n' "$(cpu_count)" "$mem" "$swap" "$(detect_iface)"
-  LINE_MBPS="$(prompt_line_reference)"
   RTT_MS="$(prompt_uint '你本地连接这台 VPS 大约多少毫秒（不知道直接回车）' 160 1 3000)"
-  PROFILE="$(default_profile_for_rtt "$RTT_MS")"
-  suggested="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
-  printf '\n推荐方案：%s\n' "$(profile_label "$PROFILE")"
-  printf '整台机器所有用户合计上限：%s Mbps\n' "$suggested"
-  read -r -p "选择 [Enter=接受/2=速度优先/3=推荐均衡/4=稳定优先/5=手动]: " answer
-  case "${answer:-accept}" in
+  printf '%s\n' \
+    '' \
+    '请选择网络策略：' \
+    '  1) 多设备/不同网络自适应（推荐，不限制整机总速度）' \
+    '  2) 每条 TCP 连接最多 450 Mbps' \
+    '  3) 每条 TCP 连接最多 950 Mbps' \
+    '  4) 手动设置单条 TCP 连接上限' \
+    '  5) 高级：限制整台机器所有连接的合计速度'
+  read -r -p '请选择 [1]: ' answer
+  case "${answer:-1}" in
+    1)
+      LIMIT_MODE=adaptive
+      RATE_MBPS=950
+      LINE_MBPS=1000
+      SHAPER_MODE=fq
+      ;;
     2)
-      PROFILE="speed"
-      RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
+      LIMIT_MODE=perflow
+      RATE_MBPS=450
+      LINE_MBPS=500
+      SHAPER_MODE=fq
       ;;
     3)
-      PROFILE="balanced"
-      RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
+      LIMIT_MODE=perflow
+      RATE_MBPS=950
+      LINE_MBPS=1000
+      SHAPER_MODE=fq
       ;;
     4)
-      PROFILE="stable"
-      RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
+      custom="$(prompt_uint '每条 TCP 连接上限（Mbps）' 950 10 100000)"
+      LIMIT_MODE=perflow
+      RATE_MBPS="$custom"
+      LINE_MBPS="$custom"
+      SHAPER_MODE=fq
       ;;
     5)
-      custom="$(prompt_uint '自定义总出口上限（Mbps）' "$suggested" 10 100000)"
-      PROFILE="custom"
+      custom="$(prompt_uint '整台机器所有连接合计上限（Mbps）' 2300 10 100000)"
+      LIMIT_MODE=total
       RATE_MBPS="$custom"
+      LINE_MBPS="$custom"
+      SHAPER_MODE=auto
       ;;
-    *) RATE_MBPS="$suggested" ;;
+    *) die "无效选项" ;;
   esac
-  SHAPING="on"; IFACE="auto"; SHAPER_MODE="auto"
+  PROFILE="custom"; SHAPING="on"; IFACE="auto"
   save_config
   install_files
   apply_all
@@ -735,6 +790,7 @@ parse_install_args() {
       --rtt) [[ $# -ge 2 ]] || die "--rtt 缺少值"; RTT_MS="$2"; shift 2 ;;
       --profile) [[ $# -ge 2 ]] || die "--profile 缺少值"; PROFILE="$2"; shift 2 ;;
       --rate) [[ $# -ge 2 ]] || die "--rate 缺少值"; RATE_MBPS="$2"; PROFILE=custom; shift 2 ;;
+      --mode) [[ $# -ge 2 ]] || die "--mode 缺少值"; LIMIT_MODE="$2"; shift 2 ;;
       --iface) [[ $# -ge 2 ]] || die "--iface 缺少值"; IFACE="$2"; shift 2 ;;
       --non-interactive) interactive=0; shift ;;
       *) die "未知安装参数：$1" ;;
@@ -744,8 +800,12 @@ parse_install_args() {
   is_uint "$LINE_MBPS" && (( LINE_MBPS >= 10 && LINE_MBPS <= 100000 )) || die "无效 --line"
   is_uint "$RTT_MS" && (( RTT_MS >= 1 && RTT_MS <= 3000 )) || die "无效 --rtt"
   [[ "$PROFILE" =~ ^(speed|balanced|stable|custom)$ ]] || die "无效 --profile"
+  [[ "$LIMIT_MODE" =~ ^(adaptive|perflow|total)$ ]] || die "无效 --mode"
   [[ "$IFACE" == auto || "$IFACE" =~ ^[a-zA-Z0-9_.:-]+$ ]] || die "无效 --iface"
-  if [[ "$PROFILE" != custom ]]; then RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"; fi
+  if [[ "$PROFILE" != custom ]]; then
+    RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
+    LIMIT_MODE=perflow
+  fi
   is_uint "$RATE_MBPS" || die "无效 --rate"
   SHAPING=on
   need_root "$@"
@@ -774,35 +834,37 @@ menu() {
   [[ -t 0 ]] || { usage; return; }
   while true; do
     load_config
-    local speed_rate balanced_rate stable_rate
-    speed_rate="$(recommended_rate "$LINE_MBPS" speed)"
-    balanced_rate="$(recommended_rate "$LINE_MBPS" balanced)"
-    stable_rate="$(recommended_rate "$LINE_MBPS" stable)"
+    local current_text
+    case "$LIMIT_MODE" in
+      adaptive) current_text='不限制整机总速度；不同设备各自适应网络' ;;
+      perflow) current_text="每条 TCP 连接最多 ${RATE_MBPS} Mbps；多设备可同时使用" ;;
+      total) current_text="整台机器所有设备合计最多 ${RATE_MBPS} Mbps" ;;
+    esac
     printf '\n%bNetShape SSH 交互面板%b\n' "$BOLD" "$RESET"
-    printf '当前总出口上限：%s Mbps（整台机器所有用户合计）\n' "$RATE_MBPS"
-    printf '当前方案：%s｜延迟参考：%sms｜队列：%s\n' "$(profile_label "$PROFILE")" "$RTT_MS" "$(shaper_label "$SHAPER_MODE")"
+    printf '当前：%s\n' "$current_text"
+    printf '延迟参考：%sms｜队列：%s\n' "$RTT_MS" "$(shaper_label "$SHAPER_MODE")"
     printf '%s\n' \
-      '  1) 重新设置（不知道带宽也能使用）' \
-      "  2) 速度优先：调整到 ${speed_rate} Mbps" \
-      "  3) 推荐均衡：调整到 ${balanced_rate} Mbps（建议）" \
-      "  4) 稳定优先：调整到 ${stable_rate} Mbps（断流时使用）" \
-      '  5) 手动填写整台机器总出口上限' \
+      '  1) 多设备/不同网络自适应（推荐，无整机总上限）' \
+      '  2) 每条 TCP 连接最多 450 Mbps' \
+      '  3) 每条 TCP 连接最多 950 Mbps' \
+      '  4) 手动设置单条 TCP 连接上限' \
+      '  5) 高级：设置整台机器合计上限' \
       '  6) 查看状态与重传' \
       '  7) 诊断冲突' \
       '  8) Nginx/Emby 不限流片段与审计' \
-      '  9) 暂停总出口限速' \
+      '  9) 修改到本地的大致延迟' \
       '  0) 退出'
     read -r -p '请选择: ' answer
     case "$answer" in
-      1) wizard ;;
-      2) set_profile speed ;;
-      3) set_profile balanced ;;
-      4) set_profile stable ;;
-      5) set_rate "$(prompt_uint '整机总出口上限（Mbps）' "$RATE_MBPS" 10 100000)" ;;
+      1) set_adaptive ;;
+      2) set_rate 450 ;;
+      3) set_rate 950 ;;
+      4) set_rate "$(prompt_uint '每条 TCP 连接上限（Mbps）' "$RATE_MBPS" 10 100000)" ;;
+      5) set_total_rate "$(prompt_uint '整台机器所有设备合计上限（Mbps）' 2300 10 100000)" ;;
       6) show_status ;;
       7) diagnose ;;
       8) write_nginx_snippet; nginx_audit ;;
-      9) set_off ;;
+      9) set_rtt "$(prompt_uint '你本地连接这台 VPS 大约多少毫秒' "$RTT_MS" 1 3000)" ;;
       0) return ;;
       *) warn "无效选项" ;;
     esac
@@ -811,22 +873,22 @@ menu() {
 
 usage() {
   cat <<'EOF'
-NetShape Manager - 自适应 TCP/BBR + 兼容限速 SSH 面板
+NetShape Manager - 多设备/多网络 TCP 自适应 SSH 面板
 
 首次安装：
   sudo bash netshape-manager.sh install
-  sudo bash netshape-manager.sh install --non-interactive --line 500 --rtt 160
+  sudo bash netshape-manager.sh install --non-interactive --mode adaptive --rtt 160
 
 安装后：
   netshape                 打开 SSH 交互面板
-  netshape profile speed   速度优先
-  netshape profile balanced  推荐均衡
-  netshape profile stable  稳定优先
-  netshape rate 470        自定义总出口 Mbps，并同步 TCP 参数
-  netshape line 1000       更新计算参考速度并重算
+  netshape adaptive        多设备自适应，不限制整机总速度
+  netshape per-flow 450    每条 TCP 连接最多 450 Mbps
+  netshape per-flow 950    每条 TCP 连接最多 950 Mbps
+  netshape total 2300      高级：整台机器合计最多 2300 Mbps
+  netshape rate 470        per-flow 470 的兼容简写
   netshape rtt 160         更新 RTT 并重算
-  netshape 450             rate 450 的简写
-  netshape off             暂停 HTB，总出口恢复 fq
+  netshape 450             per-flow 450 的简写
+  netshape off             取消人为限速，恢复 fq
   netshape apply           重新应用持久化配置
   netshape status          查看机器、TCP、qdisc、class 和重传
   netshape diagnose        检查重复 sysctl/旧服务
@@ -834,7 +896,7 @@ NetShape Manager - 自适应 TCP/BBR + 兼容限速 SSH 面板
   netshape nginx-audit     只读审计 Nginx 限速项
   netshape uninstall       卸载自身
 
-说明：Nginx 片段取消的是应用层单请求限速；NetShape 仍保护服务器出口。
+说明：默认不限制整机总速度。BBR 与 fq 会让不同设备的 TCP 连接各自适应网络。
 EOF
 }
 
@@ -843,6 +905,9 @@ main() {
   case "$command" in
     install) parse_install_args "$@" ;;
     menu) menu ;;
+    adaptive) set_adaptive ;;
+    per-flow) set_rate "${2:-}" ;;
+    total) set_total_rate "${2:-}" ;;
     profile) set_profile "${2:-}" ;;
     rate) set_rate "${2:-}" ;;
     line) set_line "${2:-}" ;;
