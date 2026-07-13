@@ -8,12 +8,11 @@
 
 - SSH 中文交互面板；安装后直接运行 `netshape`
 - 自动识别 CPU、RAM、Swap、默认出口网卡、MTU、内核和 BBR 支持
-- 不知道 VPS 套餐带宽也能安装，向导提供“不知道 / 约500M / 约1G / 自定义”选择
-- 面板只显示三个直观方案：速度优先、推荐均衡、稳定优先，并显示将要采用的具体上限
+- 默认使用多设备/多网络自适应，不限制整台机器的合计速度
+- 可选 450M、950M 或自定义的单条 TCP 连接上限，多设备不共享这个上限
+- 仅在高级模式下才使用 HTB/TBF 限制整台机器合计速度
 - 询问到本地的大致延迟；不知道可直接使用默认值
-- 优先使用 HTB + fq；不兼容时自动尝试 TBF + fq，最后才回退 fq maxrate
-
-- 自定义线路或限速时，同步重算 TCP 参数
+- 自定义单连接上限、整机上限或 RTT 时同步重算 TCP 参数
 - 使用独立 sysctl 文件，不覆盖 `/etc/sysctl.conf`
 - 检测旧 sysctl 和旧 `tc` 服务冲突，但不会擅自删除其他工具的配置
 - 生成 Nginx/Emby 不限流片段，并只读审计可能影响播放的限速项
@@ -49,10 +48,10 @@ sudo netshape
 
 ### 一键无人值守安装
 
-500M 线路、160ms RTT、均衡档示例：
+多设备自适应、160ms RTT 示例：
 
 ```bash
-curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install --non-interactive --line 500 --rtt 160 --profile balanced
+curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install --non-interactive --mode adaptive --rtt 160
 ```
 
 ### 本地文件安装
@@ -66,27 +65,25 @@ sudo ./netshape-manager.sh install
 
 向导会询问：
 
-1. 是否知道 VPS 套餐写的端口速度；不知道可直接选择默认项；
-2. 你本地连接 VPS 大约多少毫秒；不知道可直接回车；
-3. 使用推荐方案，还是速度优先、稳定优先或手动上限。
+1. 你本地连接 VPS 大约多少毫秒；不知道可直接回车；
+2. 使用多设备自适应、单连接上限，还是高级整机合计上限。
 
 无人值守安装示例：
 
 ```bash
 sudo ./netshape-manager.sh install \
   --non-interactive \
-  --line 500 \
+  --mode adaptive \
   --rtt 160 \
-  --profile balanced
 ```
 
-固定自定义出口：
+每条 TCP 连接最多 950 Mbps：
 
 ```bash
 sudo ./netshape-manager.sh install \
   --non-interactive \
-  --line 1000 \
-  --rtt 80 \
+  --mode perflow \
+  --rtt 160 \
   --rate 950
 ```
 
@@ -103,20 +100,18 @@ sudo netshape
 常用快捷命令：
 
 ```bash
-sudo netshape profile speed      # 速度优先
-sudo netshape profile balanced   # 推荐均衡
-sudo netshape profile stable     # 稳定优先
-sudo netshape rate 470           # 自定义 470M，并同步 TCP 参数
-sudo netshape rtt 160            # 更新 RTT，重新推荐并应用
-sudo netshape line 1000          # 高级：更新计算参考速度
-sudo netshape 450                # netshape rate 450 的简写
+sudo netshape adaptive           # 推荐：多设备自适应，无整机总上限
+sudo netshape per-flow 450       # 每条 TCP 连接最多 450 Mbps
+sudo netshape per-flow 950       # 每条 TCP 连接最多 950 Mbps
+sudo netshape total 2300         # 高级：整台机器合计最多 2300 Mbps
+sudo netshape rtt 160            # 更新到本地的大致延迟
 sudo netshape status
 sudo netshape diagnose
 sudo netshape off                # 暂停限速，保留 fq/fq_codel
 sudo netshape apply              # 恢复持久化配置
 ```
 
-每次执行 `profile`、`rate`、`rtt` 或 `line`，都会重新计算 TCP 缓冲并应用 qdisc。持久化配置位于 `/etc/netshape-manager.conf`。
+每次修改策略、上限或 RTT，都会重新计算 TCP 缓冲并应用 qdisc。持久化配置位于 `/etc/netshape-manager.conf`。
 
 ## Emby + Nginx 不限流
 
@@ -140,13 +135,15 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-这里的“不限流”指 Nginx 不对单个 Emby 请求设置应用层速率上限。NetShape 仍会保护服务器出口，避免多用户共同打满线路。脚本不会自动修改现有站点，因为不同面板和反代模板的结构差异很大。
+这里的“不限流”指 Nginx 不对单个 Emby 请求设置应用层速率上限。默认自适应模式也不限制整机总速度；每台设备的 TCP 连接由 BBR 分别适应自己的网络。脚本不会自动修改现有站点，因为不同面板和反代模板的结构差异很大。
 
 ## 调优原理
 
-### 1. 总出口保护
+### 1. 多设备独立适应
 
-脚本优先使用 HTB + fq 控制整机总出口并公平排队。如果 VPS 内核拒绝 HTB，会自动尝试兼容性更好的 TBF + fq。两者都不可用时才退回 fq maxrate；该最后回退模式限制单个连接，面板会明确提醒它不保证整机合计上限。
+默认模式只使用 fq 做连接分离与 pacing，不设置总出口上限。BBR 在每条 TCP 连接上分别估计带宽和 RTT，因此不同运营商、不同 Wi-Fi/蜂窝网络的设备不会共同被锁死在 450M 或 950M。
+
+`fq maxrate` 是单条流的上限，不是设备上限；一个播放器如果建立多条 TCP 连接，设备合计速度可能超过该数值。整机合计上限只适合明确需要避免打满物理端口的场景，属于高级功能。
 
 整形只控制服务器发出的流量。它不能修复上游拥塞、入口丢包、源站转码不足或客户端 Wi-Fi 问题。
 
@@ -178,15 +175,15 @@ sudo netshape diagnose
 
 重点观察：
 
-- 面板显示的队列模式是否为 HTB + fq 或 TBF + fq；
-- qdisc/class 的速率是否为预期值；
+- 默认自适应模式是否显示普通 fq；
+- 若使用高级整机上限，队列是否为 HTB + fq 或 TBF + fq；
 - qdisc/class 的 `dropped`、`overlimits` 是否持续快速增长；
 - TCP 重传计数是否在播放时快速增加；
 - Nginx error log 是否出现 upstream timeout、client prematurely closed；
 - Emby 是否正在转码，CPU、磁盘或源站上行是否成为瓶颈；
 - MTU/PMTU、隧道封装和跨境线路是否造成黑洞或持续丢包。
 
-若速度优先方案仍断流，先切到“推荐均衡”；若重传仍持续增长，再切到“稳定优先”。只用一次测速结果不能证明流媒体长连接稳定。
+若自适应模式仍断流，应检查对应客户端路径的丢包、MTU、Nginx/Emby 日志和转码负载；不要先用很低的整机总上限掩盖问题。只用一次测速结果不能证明流媒体长连接稳定。
 
 ## 开发自检
 
