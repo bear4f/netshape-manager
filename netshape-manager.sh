@@ -219,6 +219,75 @@ line_reference_label() {
   esac
 }
 
+# Root qdisc the current config should have produced, so the panel can spot a
+# config that never got applied or was overwritten by another service.
+expected_root_qdisc() {
+  local shaping="${1:-on}" mode="${2:-combo}" shaper="${3:-auto}" total="${4:-0}"
+  if [[ "$shaping" == off || "$mode" == adaptive || "$mode" == perflow ]]; then
+    printf 'fq\n'
+    return
+  fi
+  if [[ "$mode" == combo ]] && (( total == 0 )); then
+    printf 'fq\n'
+    return
+  fi
+  printf '%s\n' "$shaper"
+}
+
+actual_root_qdisc() {
+  local iface="${1:-}"
+  [[ -n "$iface" ]] || return 0
+  has tc || return 0
+  tc qdisc show dev "$iface" 2>/dev/null | awk 'NR==1 {print $2; exit}'
+}
+
+# Prints the actual qdisc only when it disagrees with the saved config.
+qdisc_drift() {
+  local iface="$1" shaping="$2" mode="$3" shaper="$4" total="$5" actual expected
+  actual="$(actual_root_qdisc "$iface")"
+  [[ -n "$actual" ]] || return 0
+  expected="$(expected_root_qdisc "$shaping" "$mode" "$shaper" "$total")"
+  case "$expected" in
+    fq) [[ "$actual" == fq || "$actual" == fq_codel ]] && return 0 ;;
+    auto) [[ "$actual" == cake || "$actual" == htb || "$actual" == tbf ]] && return 0 ;;
+    *) [[ "$actual" == "$expected" ]] && return 0 ;;
+  esac
+  printf '%s\n' "$actual"
+}
+
+# Cheap enough to run on every panel render; nginx -T is not.
+nginx_snippet_state() {
+  has nginx || { printf 'none\n'; return; }
+  [[ -e "$NGINX_SNIPPET" ]] || { printf 'missing\n'; return; }
+  if grep -rqs --exclude="$(basename "$NGINX_SNIPPET")" 'netshape-emby-proxy\.conf' /etc/nginx/ 2>/dev/null; then
+    printf 'ok\n'
+  else
+    printf 'unlinked\n'
+  fi
+}
+
+# Retransmitted share of all sent segments. A bare cumulative counter tells the
+# user nothing; a percentage maps straight onto "should I drop a tier".
+retrans_rate() {
+  has nstat || return 0
+  local out sent retrans
+  out="$(nstat -asz 2>/dev/null)" || return 0
+  [[ -n "$out" ]] || return 0
+  sent="$(printf '%s\n' "$out" | awk '$1=="TcpOutSegs" {print $2; exit}')"
+  retrans="$(printf '%s\n' "$out" | awk '$1=="TcpRetransSegs" {print $2; exit}')"
+  is_uint "${sent:-}" && is_uint "${retrans:-}" || return 0
+  (( sent > 0 )) || return 0
+  awk -v r="$retrans" -v s="$sent" 'BEGIN {printf "%.2f\n", r * 100 / s}'
+}
+
+retrans_verdict() {
+  awk -v p="${1:-0}" 'BEGIN {
+    if (p < 0.5) print "正常";
+    else if (p < 2) print "偏高，留意断流";
+    else print "过高，建议降一档";
+  }'
+}
+
 format_bytes() {
   local bytes="$1"
   if (( bytes >= 1073741824 )); then
@@ -631,7 +700,9 @@ set_total_rate() {
   SHAPING="on"
   SHAPER_MODE="auto"
   save_config
-  apply_all
+  # The sysctl profile depends only on RATE_MBPS and RTT_MS, so reshaping the
+  # queue is enough here; skipping sysctl -p keeps the panel responsive.
+  apply_shape
 }
 
 set_rtt() {
@@ -669,6 +740,14 @@ set_off() {
   SHAPING="off"
   save_config
   apply_shape
+}
+
+set_resume() {
+  need_root "$@"
+  load_config
+  SHAPING="on"
+  save_config
+  apply_all
 }
 
 write_nginx_snippet() {
@@ -791,8 +870,14 @@ show_status() {
     tc -s class show dev "$iface" 2>/dev/null || true
   fi
   if has nstat; then
-    printf '\n%b▸ TCP 重传计数（累计）%b\n' "$BOLD" "$RESET"
-    nstat -az 2>/dev/null | awk '$1 ~ /TcpRetransSegs|TcpExtTCPLostRetransmit|TcpExtTCPFastRetrans/ {print}' || true
+    local pct
+    printf '\n%b▸ TCP 重传（自开机累计）%b\n' "$BOLD" "$RESET"
+    pct="$(retrans_rate)"
+    if [[ -n "$pct" ]]; then
+      printf '  重传率 %s%%  —— %s\n' "$pct" "$(retrans_verdict "$pct")"
+      printf '  %b参考：<0.5%% 正常｜0.5-2%% 偏高｜>2%% 建议把单连接上限降一档%b\n' "$DIM" "$RESET"
+    fi
+    nstat -asz 2>/dev/null | awk '$1 ~ /TcpOutSegs|TcpRetransSegs|TcpExtTCPLostRetransmit|TcpExtTCPFastRetrans/ {printf "  %s %s\n", $1, $2}' || true
   fi
 }
 
@@ -823,21 +908,51 @@ diagnose() {
 confirm_adaptive() {
   local reply
   [[ -t 0 ]] || return 0
-  read -r -p '不限速模式在跨境/共享线路上会大量重传甚至断流，确定使用？[y/N]: ' reply
+  read -r -p '不限速模式在跨境/共享线路上会大量重传甚至断流，确定使用？[y/N]: ' reply || return 1
   [[ "$reply" =~ ^[Yy]$ ]]
 }
 
+# Returns 1 when the user cancels with q or Ctrl-D so callers can go back to
+# the menu instead of being forced to enter a value.
 prompt_uint() {
   local prompt="$1" default="$2" min="$3" max="$4" value
   while true; do
-    read -r -p "$prompt [$default]: " value
+    if ! read -r -p "$prompt [$default]: " value; then
+      printf '\n' >&2
+      return 1
+    fi
     value="${value:-$default}"
+    [[ "$value" == q || "$value" == Q ]] && return 1
     if is_uint "$value" && (( value >= min && value <= max )); then
       printf '%s\n' "$value"
-      return
+      return 0
     fi
-    warn "请输入 $min-$max 之间的整数"
+    warn "请输入 $min-$max 之间的整数（q 返回）"
   done
+}
+
+# Shared by the wizard and the panel so both offer the same port presets.
+# Prompts go to stderr because the caller reads stdout in $(...).
+prompt_total_mbps() {
+  local answer
+  printf '%s\n' \
+    '' \
+    '  这台 VPS 的端口/线路有多大？（整机总出口保护，防止打满端口）' \
+    '    1) 2.5G 口：总出口 2300 Mbps' \
+    '    2) 1G 口：总出口 900 Mbps' \
+    '    3) 500M 口：总出口 450 Mbps' \
+    '    4) 不知道/不限制总出口' \
+    '    5) 自定义' >&2
+  read -r -p '  请选择 [1]（q 返回）: ' answer || { printf '\n' >&2; return 1; }
+  case "${answer:-1}" in
+    1) printf '2300\n' ;;
+    2) printf '900\n' ;;
+    3) printf '450\n' ;;
+    4) printf '0\n' ;;
+    5) prompt_uint '  整机总出口上限（Mbps，0 表示不限）' "${TOTAL_MBPS:-2300}" 0 100000 ;;
+    q|Q) return 1 ;;
+    *) warn "无效选项"; return 1 ;;
+  esac
 }
 
 wizard() {
@@ -847,24 +962,8 @@ wizard() {
   mem="$(mem_total_mb)"; swap="$(swap_total_mb)"
   panel_title 'NetShape 安装向导'
   printf '  检测到：%s vCPU｜%s MB 内存｜%s MB Swap｜网卡 %s\n\n' "$(cpu_count)" "$mem" "$swap" "$(detect_iface)"
-  RTT_MS="$(prompt_uint '你本地连接这台 VPS 大约多少毫秒（不知道直接回车）' 160 1 3000)"
-  printf '%s\n' \
-    '' \
-    '这台 VPS 的端口/线路有多大？（决定整机总出口保护，防止打满端口）' \
-    '  1) 2.5G 口：总出口 2300 Mbps' \
-    '  2) 1G 口：总出口 900 Mbps' \
-    '  3) 500M 口：总出口 450 Mbps' \
-    '  4) 不知道/不限制总出口' \
-    '  5) 自定义'
-  read -r -p '请选择 [1]: ' answer
-  case "${answer:-1}" in
-    1) TOTAL_MBPS=2300 ;;
-    2) TOTAL_MBPS=900 ;;
-    3) TOTAL_MBPS=450 ;;
-    4) TOTAL_MBPS=0 ;;
-    5) TOTAL_MBPS="$(prompt_uint '整机总出口上限（Mbps，0 表示不限）' 2300 0 100000)" ;;
-    *) die "无效选项" ;;
-  esac
+  RTT_MS="$(prompt_uint '你本地连接这台 VPS 大约多少毫秒（不知道直接回车）' 160 1 3000)" || die "已取消安装"
+  TOTAL_MBPS="$(prompt_total_mbps)" || die "已取消安装"
   printf '%s\n' \
     '' \
     '观看设备的家宽档位？（单条 TCP 连接上限，防止单条流打爆到家的路径）' \
@@ -874,7 +973,7 @@ wizard() {
     '  4) 1G 家宽：单连接 900 Mbps（速度优先）' \
     '  5) 自定义单连接上限' \
     '  6) 不限速自适应（仅干净直连线路，跨境线路易大量重传）'
-  read -r -p '请选择 [1]: ' answer
+  read -r -p '请选择 [1]: ' answer || die "已取消安装"
   case "${answer:-1}" in
     1)
       LIMIT_MODE=combo
@@ -901,7 +1000,7 @@ wizard() {
       SHAPER_MODE=auto
       ;;
     5)
-      custom="$(prompt_uint '单条 TCP 连接上限（Mbps）' 430 10 100000)"
+      custom="$(prompt_uint '单条 TCP 连接上限（Mbps）' 430 10 100000)" || die "已取消安装"
       LIMIT_MODE=combo
       RATE_MBPS="$custom"
       LINE_MBPS="$custom"
@@ -1039,8 +1138,14 @@ uninstall_all() {
   log "已卸载 NetShape；Nginx 片段和备份保留，避免破坏现有反代"
 }
 
+panel_iface() {
+  local iface="${IFACE:-auto}"
+  [[ "$iface" == auto ]] && iface="$(detect_iface)"
+  printf '%s\n' "$iface"
+}
+
 render_menu() {
-  local current_text queue_text total_text
+  local current_text queue_text total_text drift pct snippet
   local m1=' ' m2=' ' m3=' ' m4=' ' m5=' ' m7=' '
   if (( TOTAL_MBPS > 0 )); then
     total_text="整机 ≤ ${TOTAL_MBPS} Mbps"
@@ -1074,6 +1179,25 @@ render_menu() {
   printf '  %b当前策略%b  %b%b%b\n' "$DIM" "$RESET" "$GREEN" "$current_text" "$RESET"
   printf '  %b延迟参考%b  %s ms\n' "$DIM" "$RESET" "$RTT_MS"
   printf '  %b队列模式%b  %s\n' "$DIM" "$RESET" "$queue_text"
+  pct="$(retrans_rate)"
+  if [[ -n "$pct" ]]; then
+    printf '  %b重传率%b    %s%% —— %s\n' "$DIM" "$RESET" "$pct" "$(retrans_verdict "$pct")"
+  fi
+  drift="$(qdisc_drift "$(panel_iface)" "$SHAPING" "$LIMIT_MODE" "${SHAPER_MODE:-auto}" "$TOTAL_MBPS")"
+  if [[ -n "$drift" ]]; then
+    printf '  %b[!] 实际生效的队列是 %s，与上面的策略不一致%b\n' "$YELLOW" "$drift" "$RESET"
+    printf '      %b可能被其他服务覆盖或重启后未应用，按 a 重新应用%b\n' "$DIM" "$RESET"
+  fi
+  snippet="$(nginx_snippet_state)"
+  case "$snippet" in
+    unlinked)
+      printf '  %b[!] Nginx 反代片段没有被任何站点 include，等于没生效%b\n' "$YELLOW" "$RESET"
+      printf '      %b这是反代掉速最常见的原因，按 8 查看修复方法%b\n' "$DIM" "$RESET"
+      ;;
+    missing)
+      printf '  %b[!] 本机装了 Nginx 但未生成 Emby 片段：netshape nginx-snippet%b\n' "$YELLOW" "$RESET"
+      ;;
+  esac
   rule_light
   printf '  %b家宽档位（单条连接上限，多设备各自跑满）%b  %b▸ 当前%b\n' "$BOLD" "$RESET" "$DIM" "$RESET"
   printf '  %b%s%b %b1)%b 430 Mbps —— 500M 家宽·Emby 稳定（推荐）\n' "$GREEN" "$m1" "$RESET" "$BOLD" "$RESET"
@@ -1086,30 +1210,85 @@ render_menu() {
   printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
   printf '    %b8)%b 状态与诊断（重传、冲突、Nginx 审计）\n' "$BOLD" "$RESET"
   printf '    %b9)%b 修改到本地的大致延迟\n' "$BOLD" "$RESET"
+  printf '    %ba)%b 重新应用当前配置（队列被覆盖或重启后用）\n' "$BOLD" "$RESET"
+  if [[ "$SHAPING" == off ]]; then
+    printf '    %bp)%b %b恢复人为限速%b\n' "$BOLD" "$RESET" "$GREEN" "$RESET"
+  else
+    printf '    %bp)%b 暂停人为限速（保留 fq 公平排队）\n' "$BOLD" "$RESET"
+  fi
   printf '    %b0)%b 退出\n' "$BOLD" "$RESET"
   rule_light
 }
 
+pause_for_menu() {
+  local discard
+  [[ -t 0 ]] || return 0
+  printf '\n'
+  read -r -p "  $(printf '%b按回车返回菜单…%b' "$DIM" "$RESET")" discard || printf '\n'
+}
+
+# Panel actions run in a subshell so a failing action (which calls die) drops
+# back to the menu instead of closing the whole panel. Every action persists
+# through save_config, and the loop reloads it, so nothing is lost.
+run_action() {
+  ( "$@" ) || warn "操作未完成，已返回菜单"
+}
+
 menu() {
   [[ -t 0 ]] || { usage; return; }
-  local answer
+  local answer value
+  if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
+    warn "当前不是 root，面板为只读模式；要修改请运行：sudo netshape"
+  fi
   while true; do
     load_config
     render_menu
-    read -r -p '  请选择 [0-9]: ' answer
+    if ! read -r -p '  请选择 [0-9 / a / p]: ' answer; then
+      printf '\n'
+      return 0
+    fi
     case "$answer" in
-      1) set_rate 430 ;;
-      2) set_rate 450 ;;
-      3) set_rate 850 ;;
-      4) set_rate 900 ;;
-      5) set_rate "$(prompt_uint '单条 TCP 连接上限（Mbps）' "$RATE_MBPS" 10 100000)" ;;
-      6) set_total_rate "$(prompt_uint '整机总出口上限（Mbps，0 表示不限）' "$TOTAL_MBPS" 0 100000)" ;;
-      7) if confirm_adaptive; then set_adaptive; else warn "已取消，保持当前策略"; fi ;;
-      8) diagnose ;;
-      9) set_rtt "$(prompt_uint '你本地连接这台 VPS 大约多少毫秒' "$RTT_MS" 1 3000)" ;;
-      0) return ;;
-      *) warn "无效选项" ;;
+      1) run_action set_rate 430 ;;
+      2) run_action set_rate 450 ;;
+      3) run_action set_rate 850 ;;
+      4) run_action set_rate 900 ;;
+      5)
+        if value="$(prompt_uint '  单条 TCP 连接上限（Mbps，q 返回）' "$RATE_MBPS" 10 100000)"; then
+          run_action set_rate "$value"
+        else
+          info "已取消，保持当前策略"; continue
+        fi
+        ;;
+      6)
+        if value="$(prompt_total_mbps)"; then
+          run_action set_total_rate "$value"
+        else
+          info "已取消，保持当前策略"; continue
+        fi
+        ;;
+      7)
+        if confirm_adaptive; then
+          run_action set_adaptive
+        else
+          info "已取消，保持当前策略"; continue
+        fi
+        ;;
+      8) run_action diagnose ;;
+      9)
+        if value="$(prompt_uint '  你本地连接这台 VPS 大约多少毫秒（q 返回）' "$RTT_MS" 1 3000)"; then
+          run_action set_rtt "$value"
+        else
+          info "已取消，保持当前策略"; continue
+        fi
+        ;;
+      a|A) run_action apply_all ;;
+      p|P)
+        if [[ "$SHAPING" == off ]]; then run_action set_resume; else run_action set_off; fi
+        ;;
+      0|q|Q) return 0 ;;
+      *) warn "无效选项"; continue ;;
     esac
+    pause_for_menu
   done
 }
 
@@ -1127,10 +1306,12 @@ NetShape Manager - 单连接上限 + 整机总出口 双层限速 SSH 面板
   netshape 450             单条连接 ≤450M（500M 家宽·速度优先）
   netshape 850             单条连接 ≤850M（1G 家宽·稳定）
   netshape 900             单条连接 ≤900M（1G 家宽·速度优先）
+  netshape per-flow 600    同上，单条连接上限（rate 是它的别名）
   netshape total 2300      整机总出口（按 VPS 端口，0 = 不限制）
   netshape adaptive        不限速自适应（仅干净直连线路）
   netshape rtt 160         更新 RTT 并重算 TCP 缓冲
   netshape off             暂停限速，保留 fq
+  netshape on              恢复限速（resume 同义）
   netshape apply           重新应用持久化配置
   netshape status          查看机器、TCP、qdisc、class 和重传
   netshape diagnose        检查重复 sysctl/旧服务并审计 Nginx
@@ -1152,13 +1333,13 @@ main() {
     install) parse_install_args "$@" ;;
     menu) menu ;;
     adaptive) set_adaptive ;;
-    per-flow) set_rate "${2:-}" ;;
+    per-flow|rate) set_rate "${2:-}" ;;
     total) set_total_rate "${2:-}" ;;
     profile) set_profile "${2:-}" ;;
-    rate) set_total_rate "${2:-}" ;;
     line) set_line "${2:-}" ;;
     rtt) set_rtt "${2:-}" ;;
     off) set_off ;;
+    on|resume) set_resume ;;
     apply) apply_all ;;
     status) show_status ;;
     diagnose) diagnose ;;
@@ -1168,7 +1349,8 @@ main() {
     help|-h|--help) usage ;;
     version|--version) printf '%s %s\n' "$PROGRAM" "$VERSION" ;;
     *)
-      if is_uint "$command"; then set_total_rate "$command"; else die "未知命令：${command}（用 --help 查看帮助）"; fi
+      # A bare number is the per-flow cap, matching `netshape 430` in the help.
+      if is_uint "$command"; then set_rate "$command"; else die "未知命令：${command}（用 --help 查看帮助）"; fi
       ;;
   esac
 }

@@ -99,6 +99,16 @@ sudo ./netshape-manager.sh install \
 sudo netshape
 ```
 
+面板顶部显示当前策略、延迟参考、队列模式和自开机以来的 TCP 重传率（`<0.5%` 正常，`0.5-2%` 偏高，`>2%` 建议把单连接上限降一档）。若实际生效的 qdisc 与保存的策略不一致（被其他服务覆盖、或重启后没有应用），面板会直接告警。
+
+除数字档位外，面板还提供：
+
+- `a` 重新应用当前配置；
+- `p` 暂停/恢复人为限速（暂停后仍保留 fq 公平排队）；
+- `0` 或 `q` 退出。
+
+数字输入处按 `q` 或 Ctrl-D 可以放弃本次修改回到菜单；某一步失败（内核不支持某种队列、Nginx 配置有错等）只会打印原因并返回菜单，不会关掉面板。
+
 常用快捷命令：
 
 ```bash
@@ -106,14 +116,18 @@ sudo netshape 430                # 单条连接 ≤430M（500M 家宽·Emby 稳�
 sudo netshape 450                # 单条连接 ≤450M（500M 家宽·速度优先）
 sudo netshape 850                # 单条连接 ≤850M（1G 家宽·稳定）
 sudo netshape 900                # 单条连接 ≤900M（1G 家宽·速度优先）
+sudo netshape per-flow 600       # 同上，任意单条连接上限（rate 是它的别名）
 sudo netshape total 2300         # 整机总出口（按 VPS 端口；0 = 不限制）
 sudo netshape adaptive           # 不限速自适应（仅干净直连线路）
 sudo netshape rtt 160            # 更新到本地的大致延迟
 sudo netshape status
 sudo netshape diagnose
 sudo netshape off                # 暂停限速，保留 fq/fq_codel
+sudo netshape on                 # 恢复限速
 sudo netshape apply              # 恢复持久化配置
 ```
+
+裸数字（`netshape 430`）设置的是**单条连接上限**；整机总出口只能通过 `netshape total`。
 
 每次修改策略、上限或 RTT，都会重新计算 TCP 缓冲并应用 qdisc。持久化配置位于 `/etc/netshape-manager.conf`。
 

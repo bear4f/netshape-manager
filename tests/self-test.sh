@@ -43,6 +43,36 @@ assert_eq 'fq（连接公平排队，不限速）' "$(queue_label off total htb)
 assert_eq 'HTB + fq maxrate（总出口＋单连接上限）' "$(queue_label on combo htb)" 'combo queue label'
 assert_eq 'fq maxrate（单条 TCP 连接上限）' "$(queue_label on combo fq)" 'combo no-total queue label'
 
+assert_eq fq "$(expected_root_qdisc off combo htb 2300)" 'paused expects fq'
+assert_eq fq "$(expected_root_qdisc on adaptive fq 0)" 'adaptive expects fq'
+assert_eq fq "$(expected_root_qdisc on perflow fq 0)" 'perflow expects fq'
+assert_eq fq "$(expected_root_qdisc on combo auto 0)" 'combo without total expects fq'
+assert_eq htb "$(expected_root_qdisc on combo htb 2300)" 'combo with total expects htb'
+assert_eq cake "$(expected_root_qdisc on total cake 900)" 'total expects recorded shaper'
+
+has() { [[ "$1" == tc ]]; }
+tc() { printf 'qdisc fq 8001: root refcnt 2 limit 10000p\n'; }
+assert_eq '' "$(qdisc_drift eth-test on combo auto 0)" 'fq matches combo without total'
+assert_eq fq "$(qdisc_drift eth-test on combo htb 2300)" 'fq flagged when HTB expected'
+tc() { printf 'qdisc htb 1: root refcnt 2 r2q 1000\n'; }
+assert_eq '' "$(qdisc_drift eth-test on combo htb 2300)" 'htb matches combo with total'
+assert_eq htb "$(qdisc_drift eth-test off combo htb 2300)" 'htb flagged while paused'
+assert_eq '' "$(qdisc_drift eth-test on total auto 900)" 'auto accepts any shaper qdisc'
+tc() { return 1; }
+assert_eq '' "$(qdisc_drift eth-test on combo htb 2300)" 'no drift claim without tc output'
+
+has() { [[ "$1" == nstat ]]; }
+nstat() { printf 'TcpOutSegs 1000000 0.0\nTcpRetransSegs 3000 0.0\n'; }
+assert_eq 0.30 "$(retrans_rate)" 'retransmission percentage'
+assert_eq '正常' "$(retrans_verdict 0.30)" 'healthy retransmission verdict'
+assert_eq '偏高，留意断流' "$(retrans_verdict 1.20)" 'elevated retransmission verdict'
+assert_eq '过高，建议降一档' "$(retrans_verdict 3.40)" 'excessive retransmission verdict'
+nstat() { printf 'TcpOutSegs 0 0.0\nTcpRetransSegs 0 0.0\n'; }
+assert_eq '' "$(retrans_rate)" 'no rate without sent segments'
+has() { return 1; }
+assert_eq '' "$(retrans_rate)" 'no rate without nstat'
+assert_eq none "$(nginx_snippet_state)" 'no snippet state without nginx'
+
 render_test() {
   SHAPING="$1" LIMIT_MODE="$2" RATE_MBPS="$3" RTT_MS=160 SHAPER_MODE="$4" TOTAL_MBPS="${5:-0}"
   render_menu
@@ -62,6 +92,11 @@ printf 'PASS: adaptive menu marker\n'
 menu_out="$(render_test off combo 430 htb 2300)"
 [[ "$menu_out" == *'已暂停人为限速'* && "$menu_out" != *'▸ 1)'* ]] || { printf 'FAIL: paused menu state\n' >&2; exit 1; }
 printf 'PASS: paused menu state\n'
+[[ "$menu_out" == *'p) 恢复人为限速'* ]] || { printf 'FAIL: paused offers resume key\n' >&2; exit 1; }
+printf 'PASS: paused offers resume key\n'
+menu_out="$(render_test on combo 430 htb 2300)"
+[[ "$menu_out" == *'p) 暂停人为限速'* && "$menu_out" == *'a) 重新应用当前配置'* ]] || { printf 'FAIL: menu offers pause and reapply keys\n' >&2; exit 1; }
+printf 'PASS: menu offers pause and reapply keys\n'
 
 tc_log="$(mktemp)"
 need_root() { :; }
