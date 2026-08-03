@@ -42,6 +42,10 @@ assert_eq 'TBF + fq（兼容整机总出口）' "$(queue_label on total tbf)" 't
 assert_eq 'fq（连接公平排队，不限速）' "$(queue_label off total htb)" 'paused queue label'
 assert_eq 'HTB + fq maxrate（总出口＋单连接上限）' "$(queue_label on combo htb)" 'combo queue label'
 assert_eq 'fq maxrate（单条 TCP 连接上限）' "$(queue_label on combo fq)" 'combo no-total queue label'
+assert_eq bbr3 "$(congestion_control_from_available 'reno bbr3 bbr cubic')" 'prefer BBRv3 when available'
+assert_eq bbr "$(congestion_control_from_available 'reno bbr cubic')" 'use standard BBR when available'
+assert_eq cubic "$(congestion_control_from_available 'reno cubic')" 'fall back to Cubic without BBR'
+assert_eq cubic "$(congestion_control_from_available 'reno bbr30 mybbr cubic')" 'match congestion controls as whole names'
 
 assert_eq fq "$(expected_root_qdisc off combo htb 2300)" 'paused expects fq'
 assert_eq fq "$(expected_root_qdisc on adaptive fq 0)" 'adaptive expects fq'
