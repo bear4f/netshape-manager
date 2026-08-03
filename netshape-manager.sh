@@ -364,15 +364,26 @@ append_sysctl() {
   fi
 }
 
-choose_congestion_control() {
-  local available=''
-  has modprobe && modprobe tcp_bbr >/dev/null 2>&1 || true
-  [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]] && available="$(< /proc/sys/net/ipv4/tcp_available_congestion_control)"
-  if [[ " $available " == *" bbr "* ]]; then
+congestion_control_from_available() {
+  local available="$1"
+  if [[ " $available " == *" bbr3 "* ]]; then
+    printf 'bbr3\n'
+  elif [[ " $available " == *" bbr "* ]]; then
     printf 'bbr\n'
   elif [[ " $available " == *" cubic "* ]]; then
-    warn "内核未提供 BBR，自动回退到 cubic"
     printf 'cubic\n'
+  else
+    return 1
+  fi
+}
+
+choose_congestion_control() {
+  local available='' cc=''
+  has modprobe && modprobe tcp_bbr >/dev/null 2>&1 || true
+  [[ -r /proc/sys/net/ipv4/tcp_available_congestion_control ]] && available="$(< /proc/sys/net/ipv4/tcp_available_congestion_control)"
+  if cc="$(congestion_control_from_available "$available")"; then
+    [[ "$cc" != cubic ]] || warn "内核未提供 BBR，自动回退到 cubic"
+    printf '%s\n' "$cc"
   else
     awk '{print $1}' /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || printf 'cubic\n'
   fi
