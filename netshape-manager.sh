@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="5.2.0"
+VERSION="5.3.0"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -14,6 +14,9 @@ SYSCTL_FILE="/etc/sysctl.d/99-zz-netshape-manager.conf"
 SERVICE_FILE="/etc/systemd/system/netshape-manager.service"
 STATE_DIR="/var/lib/netshape-manager"
 NGINX_SNIPPET="/etc/nginx/snippets/netshape-emby-proxy.conf"
+SNAPSHOT_FILE="$STATE_DIR/pre-tune.snapshot"
+LOCK_FILE="$STATE_DIR/lock"
+ROUTE_HOOK="/etc/networkd-dispatcher/routable.d/50-netshape-initcwnd"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -27,6 +30,8 @@ RESET='\033[0m'
 if [[ ! -t 1 || "${NO_COLOR:-}" ]]; then
   RED='' GREEN='' YELLOW='' BLUE='' CYAN='' DIM='' BOLD='' RESET=''
 fi
+
+RETRANS_SAMPLE_SECS=5
 
 RULE_HEAVY='━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━'
 RULE_LIGHT='──────────────────────────────────────'
@@ -53,6 +58,18 @@ need_root() {
 has() { command -v "$1" >/dev/null 2>&1; }
 
 is_uint() { [[ ${1:-} =~ ^[0-9]+$ ]]; }
+
+# Serialise mutations: two SSH sessions editing the config or replacing the
+# root qdisc at the same time interleave and leave both half-applied.
+NETSHAPE_LOCKED=0
+take_lock() {
+  (( NETSHAPE_LOCKED == 1 )) && return 0
+  has flock || return 0
+  mkdir -p "$STATE_DIR" 2>/dev/null || return 0
+  exec 9>"$LOCK_FILE" 2>/dev/null || return 0
+  flock -w 10 9 || die "另一个 netshape 进程正在修改配置，请稍后重试"
+  NETSHAPE_LOCKED=1
+}
 
 detect_iface() {
   local iface=''
@@ -127,19 +144,34 @@ tcp_mem_values() {
   fi
 }
 
+# A single socket must never be allowed to monopolise the global TCP budget:
+# tcp_mem's ceiling divided by 8 leaves room for 8 concurrent large flows.
+tcp_mem_budget_cap() {
+  local mem="$1" pages
+  pages="$(tcp_mem_values "$mem" | awk '{print $3}')"
+  printf '%s\n' $(( pages * 4096 / 8 ))
+}
+
 memory_buffer_cap() {
-  local mem="$1"
+  local mem="$1" cap budget
   if (( mem < 512 )); then
-    printf '%s\n' $((8 * 1024 * 1024))
+    cap=$((8 * 1024 * 1024))
   elif (( mem < 1024 )); then
-    printf '%s\n' $((16 * 1024 * 1024))
+    cap=$((16 * 1024 * 1024))
   elif (( mem < 2048 )); then
-    printf '%s\n' $((32 * 1024 * 1024))
+    cap=$((32 * 1024 * 1024))
   elif (( mem < 4096 )); then
-    printf '%s\n' $((64 * 1024 * 1024))
+    cap=$((64 * 1024 * 1024))
   else
-    printf '%s\n' $((128 * 1024 * 1024))
+    cap=$((128 * 1024 * 1024))
   fi
+  # The ladder above is field-proven and today it is stricter than the budget
+  # rule everywhere; the invariant is kept as a guard so editing the ladder
+  # cannot silently let one socket eat the whole tcp_mem ceiling.
+  budget="$(tcp_mem_budget_cap "$mem")"
+  (( cap > budget )) && cap="$budget"
+  (( cap > 268435456 )) && cap=268435456
+  printf '%s\n' "$cap"
 }
 
 calculate_tcp_max() {
@@ -156,13 +188,66 @@ calculate_tcp_max() {
   printf '%s\n' "$target"
 }
 
+# Which rule pinned the buffer ceiling. Without this a user who sees a
+# truncated value assumes it is 2x BDP and goes looking for the problem
+# somewhere else entirely.
+buffer_cap_reason() {
+  local rate="$1" rtt="$2" mem="$3" bdp doubled cap
+  bdp=$((rate * rtt * 125))
+  doubled=$((bdp * 2))
+  cap="$(memory_buffer_cap "$mem")"
+  if (( doubled < 8388608 )); then
+    printf '下限 8 MiB\n'
+  elif (( doubled > cap )); then
+    printf '受 %s MB 内存限制\n' "$mem"
+  else
+    printf '2 倍 BDP\n'
+  fi
+}
+
+# Two burst policies for the aggregate HTB class:
+#   policer     ~1ms of tokens. A policer judges instantaneous rate, so a big
+#               bucket is exactly what punches through it — the whole point of
+#               this tool on cross-border links.
+#   throughput  ~10ms of tokens, the pre-5.3 behaviour. Keep it if a large
+#               burst measurably helps on a clean, unpoliced line.
 calculate_htb_burst_kb() {
-  local rate="$1" burst
-  # Roughly 10ms worth of tokens; fq still paces individual TCP flows.
-  burst=$(((rate * 1250 + 1023) / 1024))
-  (( burst < 64 )) && burst=64
-  (( burst > 2048 )) && burst=2048
+  local rate="$1" mode="${2:-policer}" burst
+  if [[ "$mode" == throughput ]]; then
+    burst=$(((rate * 1250 + 1023) / 1024))
+    (( burst < 64 )) && burst=64
+    (( burst > 2048 )) && burst=2048
+  else
+    burst=$(((rate * 125 + 1023) / 1024))
+    (( burst < 32 )) && burst=32
+    (( burst > 256 )) && burst=256
+  fi
   printf '%s\n' "$burst"
+}
+
+# fq leaf queue depth. The kernel default of 100 packets per flow is far too
+# shallow at 2 Gbit x 160ms; scaled down on small boxes so the queue itself
+# cannot become the memory problem.
+fq_leaf_limits() {
+  local mem="$1"
+  if (( mem < 1024 )); then
+    printf '10240 2048\n'
+  else
+    printf '40960 8192\n'
+  fi
+}
+
+# HTB delivers roughly 93-96% of its nominal rate, so a cap set at the port's
+# line rate can never actually reach it. Only worth saying when the user has
+# set the cap right up against a familiar port size.
+burst_note() {
+  local rate="${1:-0}"
+  is_uint "$rate" && (( rate > 0 )) || return 0
+  case "$rate" in
+    2500|2400|2300|1000|960|950|900|500|450) ;;
+    *) return 0 ;;
+  esac
+  info "提示：HTB 实际投递约为标称值的 93-96%，${rate} Mbps 的上限实测约 $(( rate * 93 / 100 ))-$(( rate * 96 / 100 )) Mbps"
 }
 
 profile_label() {
@@ -197,6 +282,22 @@ queue_label() {
     tbf) printf 'TBF + fq（兼容整机总出口）\n' ;;
     fq) printf 'fq maxrate（单条 TCP 连接上限）\n' ;;
     auto) printf '自动检测\n' ;;
+    *) printf '未知\n' ;;
+  esac
+}
+
+burst_mode_label() {
+  case "${1:-}" in
+    policer) printf '小突发（贴合限速线路，默认）\n' ;;
+    throughput) printf '大突发（10ms 令牌，仅干净直连线路）\n' ;;
+    *) printf '未知\n' ;;
+  esac
+}
+
+burst_mode_short() {
+  case "${1:-}" in
+    policer) printf '小突发\n' ;;
+    throughput) printf '大突发\n' ;;
     *) printf '未知\n' ;;
   esac
 }
@@ -266,25 +367,55 @@ nginx_snippet_state() {
   fi
 }
 
-# Retransmitted share of all sent segments. A bare cumulative counter tells the
-# user nothing; a percentage maps straight onto "should I drop a tier".
+tcp_seg_counters() {
+  local out
+  has nstat || return 1
+  out="$(nstat -asz 2>/dev/null)" || return 1
+  [[ -n "$out" ]] || return 1
+  printf '%s\n' "$out" | awk '
+    $1 == "TcpOutSegs" {sent = $2}
+    $1 == "TcpRetransSegs" {retrans = $2}
+    END {if (sent == "" || retrans == "") exit 1; print sent, retrans}
+  '
+}
+
+# Cumulative since boot. On a host that has been up for months this is heavily
+# diluted, so it is reported as a weak smoke signal only and deliberately
+# carries no verdict — retrans_sample is what a decision should be based on.
 retrans_rate() {
-  has nstat || return 0
-  local out sent retrans
-  out="$(nstat -asz 2>/dev/null)" || return 0
-  [[ -n "$out" ]] || return 0
-  sent="$(printf '%s\n' "$out" | awk '$1=="TcpOutSegs" {print $2; exit}')"
-  retrans="$(printf '%s\n' "$out" | awk '$1=="TcpRetransSegs" {print $2; exit}')"
-  is_uint "${sent:-}" && is_uint "${retrans:-}" || return 0
+  local counters sent retrans
+  counters="$(tcp_seg_counters)" || return 0
+  sent="${counters%% *}"; retrans="${counters##* }"
+  is_uint "$sent" && is_uint "$retrans" || return 0
   (( sent > 0 )) || return 0
   awk -v r="$retrans" -v s="$sent" 'BEGIN {printf "%.2f\n", r * 100 / s}'
 }
 
+# Retransmitted share of segments sent inside a measurement window. Costs the
+# sample duration, so it belongs in status/diagnose rather than a panel render.
+retrans_sample() {
+  local secs="${1:-5}" first second s1 r1 s2 r2 ds dr
+  first="$(tcp_seg_counters)" || return 0
+  sleep "$secs"
+  second="$(tcp_seg_counters)" || return 0
+  s1="${first%% *}"; r1="${first##* }"
+  s2="${second%% *}"; r2="${second##* }"
+  is_uint "$s1" && is_uint "$r1" && is_uint "$s2" && is_uint "$r2" || return 0
+  ds=$((s2 - s1)); dr=$((r2 - r1))
+  # Too little traffic in the window for the ratio to mean anything.
+  (( ds >= 1000 )) || return 0
+  (( dr < 0 )) && return 0
+  awk -v r="$dr" -v s="$ds" 'BEGIN {printf "%.3f\n", r * 100 / s}'
+}
+
+# Thresholds follow the regression published by the tcpfit project: across
+# seven real hosts the clean side topped out at 0.0017% and the lowest reading
+# from a host hitting a policer was 1.354%. 0.1% sits clear of both.
 retrans_verdict() {
   awk -v p="${1:-0}" 'BEGIN {
-    if (p < 0.5) print "正常";
-    else if (p < 2) print "偏高，留意断流";
-    else print "过高，建议降一档";
+    if (p < 0.1) print "干净";
+    else if (p < 1) print "偏高，线路或档位需要留意";
+    else print "撞限速器，建议把单连接上限降一档";
   }'
 }
 
@@ -309,6 +440,8 @@ default_config() {
   IFACE="auto"
   SHAPER_MODE="auto"
   LIMIT_MODE="combo"
+  BURST_MODE="policer"
+  INITCWND=32
 }
 
 load_config() {
@@ -326,8 +459,13 @@ load_config() {
       IFACE) [[ "$value" =~ ^[a-zA-Z0-9_.:-]+$ ]] && IFACE="$value" ;;
       SHAPER_MODE) [[ "$value" =~ ^(auto|cake|htb|tbf|fq)$ ]] && SHAPER_MODE="$value" ;;
       LIMIT_MODE) [[ "$value" =~ ^(adaptive|perflow|total|combo)$ ]] && LIMIT_MODE="$value" ;;
+      BURST_MODE) [[ "$value" =~ ^(policer|throughput)$ ]] && BURST_MODE="$value" ;;
+      INITCWND) is_uint "$value" && (( value == 0 || (value >= 2 && value <= 64) )) && INITCWND="$value" ;;
     esac
   done < "$CONFIG_FILE"
+  # A rejected value on the final line would otherwise make load_config exit
+  # non-zero and take the whole script down with it under errexit.
+  return 0
 }
 
 save_config() {
@@ -346,6 +484,8 @@ save_config() {
     printf 'IFACE=%s\n' "$IFACE"
     printf 'SHAPER_MODE=%s\n' "$SHAPER_MODE"
     printf 'LIMIT_MODE=%s\n' "$LIMIT_MODE"
+    printf 'BURST_MODE=%s\n' "$BURST_MODE"
+    printf 'INITCWND=%s\n' "$INITCWND"
   } > "$temp"
   mv -f "$temp" "$CONFIG_FILE"
 }
@@ -361,6 +501,105 @@ append_sysctl() {
     printf '%s = %s\n' "$key" "$value" >> "$file"
   else
     warn "当前内核不支持 ${key}，已跳过"
+  fi
+}
+
+# Every kernel key write_sysctl_profile touches. Rollback is only as complete
+# as this list, so tests/self-test.sh asserts it against the actual
+# append_sysctl calls — a key added to one and not the other fails the build.
+TUNED_KEYS='
+vm.swappiness
+vm.min_free_kbytes
+kernel.panic
+net.core.default_qdisc
+net.ipv4.tcp_congestion_control
+net.core.somaxconn
+net.core.netdev_max_backlog
+net.ipv4.tcp_max_syn_backlog
+net.ipv4.tcp_syncookies
+net.ipv4.tcp_window_scaling
+net.ipv4.tcp_sack
+net.ipv4.tcp_dsack
+net.ipv4.tcp_timestamps
+net.ipv4.tcp_no_metrics_save
+net.ipv4.tcp_moderate_rcvbuf
+net.core.rmem_default
+net.core.wmem_default
+net.core.rmem_max
+net.core.wmem_max
+net.core.optmem_max
+net.ipv4.tcp_rmem
+net.ipv4.tcp_wmem
+net.ipv4.tcp_mem
+net.ipv4.tcp_adv_win_scale
+net.ipv4.tcp_notsent_lowat
+net.ipv4.tcp_mtu_probing
+net.ipv4.tcp_ecn
+net.ipv4.tcp_frto
+net.ipv4.tcp_fastopen
+net.ipv4.tcp_fastopen_blackhole_timeout_sec
+net.ipv4.tcp_slow_start_after_idle
+net.ipv4.tcp_tw_reuse
+net.ipv4.tcp_fin_timeout
+net.ipv4.tcp_keepalive_time
+net.ipv4.tcp_keepalive_intvl
+net.ipv4.tcp_keepalive_probes
+net.ipv4.udp_rmem_min
+net.ipv4.udp_wmem_min
+'
+
+# Removing the sysctl file does not put the running kernel back: every key
+# stays at the tuned value until reboot. The snapshot is what makes uninstall
+# actually undo something.
+take_snapshot() {
+  local key value pristine=1
+  [[ -e "$SNAPSHOT_FILE" ]] && return 0
+  mkdir -p "$STATE_DIR"
+  # An existing profile means the live values are already ours, so they cannot
+  # serve as a factory baseline. Recorded anyway (refusing would break every
+  # in-place upgrade) but flagged, so uninstall can say what it can restore.
+  if [[ -e "$SYSCTL_FILE" ]]; then
+    pristine=0
+    warn "检测到已有 NetShape sysctl 配置但没有出厂快照。"
+    warn "现在记录的是「已调优」状态，卸载只能回到这里，无法回到出厂值。"
+  fi
+  {
+    printf '# NetShape Manager pre-tune snapshot %s\n' "$(date -u +%FT%TZ 2>/dev/null || printf 'unknown')"
+    printf '# PRISTINE=%s\n' "$pristine"
+    printf '# KERNEL=%s\n' "$(uname -r 2>/dev/null || printf 'unknown')"
+    for key in $TUNED_KEYS; do
+      [[ -e "$(sysctl_path "$key")" ]] || continue
+      value="$(sysctl -n "$key" 2>/dev/null)" || continue
+      [[ -n "$value" ]] || continue
+      printf '%s=%s\n' "$key" "$value"
+    done
+  } > "$SNAPSHOT_FILE"
+  chmod 0644 "$SNAPSHOT_FILE"
+  log "已保存出厂快照：$SNAPSHOT_FILE"
+}
+
+snapshot_is_pristine() {
+  [[ -r "$SNAPSHOT_FILE" ]] || return 1
+  grep -q '^# PRISTINE=1$' "$SNAPSHOT_FILE"
+}
+
+restore_snapshot() {
+  local key value restored=0
+  if [[ ! -r "$SNAPSHOT_FILE" ]]; then
+    warn "找不到快照，只移除了配置文件；已调优的内核参数会保留到下次重启"
+    return 0
+  fi
+  # Tab and newline only in IFS, so a value like "4096 87380 33554432" is
+  # written back whole rather than being split into three sysctl calls.
+  while IFS='=' read -r key value; do
+    [[ "$key" == \#* || -z "$key" ]] && continue
+    [[ -n "$value" ]] || continue
+    sysctl -qw "$key=$value" >/dev/null 2>&1 && restored=$((restored + 1))
+  done < "$SNAPSHOT_FILE"
+  if snapshot_is_pristine; then
+    log "已按出厂快照还原 ${restored} 项内核参数"
+  else
+    warn "已还原 ${restored} 项内核参数，但快照记录的是安装时的已调优状态，不是出厂值"
   fi
 }
 
@@ -380,7 +619,9 @@ choose_congestion_control() {
 
 write_sysctl_profile() {
   need_root "$@"
+  take_lock
   load_config
+  take_snapshot
   local mem tcp_max backlog notsent cc temp min_free tcpmem
   mem="$(mem_total_mb)"
   (( mem > 0 )) || mem=1024
@@ -446,9 +687,13 @@ write_sysctl_profile() {
   if has sysctl; then
     sysctl -p "$SYSCTL_FILE" >/dev/null || die "sysctl 加载失败；配置文件保留在 $SYSCTL_FILE 供检查"
   fi
-  log "TCP 配置已更新：${cc}，缓冲上限 $(format_bytes "$tcp_max")，notsent ${notsent}B"
+  log "TCP 配置已更新：${cc}，缓冲上限 $(format_bytes "$tcp_max")（$(buffer_cap_reason "$RATE_MBPS" "$RTT_MS" "$mem")），notsent ${notsent}B"
   if (( tcp_max < RATE_MBPS * RTT_MS * 125 )); then
     warn "内存较小，TCP 缓冲上限低于单流 BDP；高 RTT 下单连接可能无法跑满线路"
+  fi
+  if (( mem <= 1024 )) && (( $(swap_total_mb) == 0 )); then
+    warn "本机 ${mem} MB 内存且没有 swap：TCP 缓冲一涨内核会直接杀进程，"
+    warn "表现为「测速跑一半掉速」。建议加 1-2G swap 再长期使用。"
   fi
 }
 
@@ -461,11 +706,125 @@ resolve_iface() {
   printf '%s\n' "$resolved"
 }
 
-restore_fq() {
-  local iface="$1"
+root_qdisc_kind() {
+  local iface="${1:-}"
+  [[ -n "$iface" ]] || return 0
+  has tc || return 0
+  tc qdisc show dev "$iface" 2>/dev/null | awk '$1 == "qdisc" {print $2; exit}'
+}
+
+baseline_qdisc() {
+  [[ -r "$STATE_DIR/baseline-qdisc" ]] || return 0
+  head -n 1 "$STATE_DIR/baseline-qdisc" 2>/dev/null
+}
+
+# Recorded once, before netshape first replaces the root qdisc, so uninstall
+# can put back what the machine actually shipped with.
+record_baseline_qdisc() {
+  local iface="$1" kind
+  [[ -e "$STATE_DIR/baseline-qdisc" ]] && return 0
+  kind="$(root_qdisc_kind "$iface")"
+  [[ -n "$kind" ]] || return 0
+  case "$kind" in
+    htb|tbf|cake) return 0 ;;   # already one of ours, not a baseline
+  esac
+  mkdir -p "$STATE_DIR"
+  printf '%s\n' "$kind" > "$STATE_DIR/baseline-qdisc"
+}
+
+# Used when shaping is paused or falls back: we want fq semantics, but on a
+# multi-queue NIC deleting the root brings back mq with fq leaves (because
+# default_qdisc=fq), which is strictly better than collapsing it to one fq.
+restore_default_qdisc() {
+  local iface="$1" baseline
+  baseline="$(baseline_qdisc)"
   tc qdisc del dev "$iface" root 2>/dev/null || true
+  case "$baseline" in
+    mq|mqprio|noqueue) return 0 ;;
+  esac
   tc qdisc replace dev "$iface" root fq 2>/dev/null || \
     tc qdisc replace dev "$iface" root fq_codel 2>/dev/null || true
+}
+
+# Uninstall path: put the original qdisc back rather than leaving the machine
+# on fq forever. mq/noqueue are rebuilt by the kernel and must not be re-added.
+restore_baseline_qdisc() {
+  local iface="$1" baseline
+  baseline="$(baseline_qdisc)"
+  tc qdisc del dev "$iface" root 2>/dev/null || true
+  case "$baseline" in
+    ''|mq|mqprio|noqueue|pfifo_fast) return 0 ;;
+    *) tc qdisc replace dev "$iface" root "$baseline" 2>/dev/null || true ;;
+  esac
+}
+
+# A root qdisc we did not put there and cannot faithfully rebuild belongs to
+# someone else's tuning; replacing it silently is how configuration disappears.
+qdisc_guard() {
+  local iface="$1" kind reply
+  kind="$(root_qdisc_kind "$iface")"
+  case "$kind" in
+    ''|mq|mqprio|noqueue|pfifo_fast|fq|fq_codel|htb|tbf|cake) return 0 ;;
+  esac
+  warn "本机根 qdisc 是 ${kind}，不是 NetShape 能原样重建的类型。"
+  warn "继续会替换它，卸载时只能恢复成 ${kind} 的默认参数，自定义配置会丢失。"
+  [[ -t 0 ]] || return 0
+  read -r -p '  仍要继续？[y/N]: ' reply || return 1
+  [[ "$reply" =~ ^[Yy]$ ]]
+}
+
+# tc normalises units on output (1000mbit prints as "1Gbit"), so verification
+# has to compare numbers, not strings.
+tc_rate_to_mbps() {
+  awk -v s="${1:-}" 'BEGIN {
+    if (!match(s, /^[0-9.]+/)) exit 1
+    v = substr(s, RSTART, RLENGTH) + 0
+    u = substr(s, RSTART + RLENGTH)
+    if (u ~ /^[Gg]/) v *= 1000
+    else if (u ~ /^[Kk]/) v /= 1000
+    else if (u !~ /^[Mm]/) v /= 1000000
+    printf "%d\n", v + 0.5
+  }'
+}
+
+# Confirm against the kernel instead of trusting tc's exit code.
+verify_shaper() {
+  local iface="$1" kind="$2" want="$3" field='' got=''
+  has tc || return 0
+  case "$kind" in
+    htb) field=rate; got="$(tc class show dev "$iface" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "rate") {print $(i+1); exit}}')" ;;
+    tbf) field=rate; got="$(tc qdisc show dev "$iface" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "rate") {print $(i+1); exit}}')" ;;
+    cake) field=bandwidth; got="$(tc qdisc show dev "$iface" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "bandwidth") {print $(i+1); exit}}')" ;;
+    fq) field=maxrate; got="$(tc qdisc show dev "$iface" 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "maxrate") {print $(i+1); exit}}')" ;;
+    *) return 0 ;;
+  esac
+  if [[ -z "$got" ]]; then
+    warn "tc 未报告 ${kind} 的 ${field}，限速可能没有真正生效：tc qdisc show dev ${iface}"
+    return 1
+  fi
+  got="$(tc_rate_to_mbps "$got")" || return 0
+  is_uint "$got" || return 0
+  if ! awk -v g="$got" -v w="$want" 'BEGIN {exit !(g >= w * 0.98 && g <= w * 1.02)}'; then
+    warn "实际生效速率 ${got} Mbps 与期望的 ${want} Mbps 不符：tc qdisc show dev ${iface}"
+    return 1
+  fi
+  return 0
+}
+
+# fq leaf shared by the HTB and TBF paths. Old kernels reject limit/flow_limit;
+# retrying plain keeps that from looking like "HTB unsupported" and falling
+# through to the compatibility shaper.
+add_fq_leaf() {
+  local iface="$1" parent="$2" handle="$3" maxrate="$4" mem="$5" error_file="$6"
+  local limits limit flow_limit args=()
+  limits="$(fq_leaf_limits "$mem")"
+  limit="${limits%% *}"; flow_limit="${limits##* }"
+  args=(fq limit "$limit" flow_limit "$flow_limit")
+  [[ -n "$maxrate" ]] && args+=(maxrate "${maxrate}mbit")
+  tc qdisc add dev "$iface" parent "$parent" handle "$handle" "${args[@]}" 2>> "$error_file" && return 0
+  args=(fq)
+  [[ -n "$maxrate" ]] && args+=(maxrate "${maxrate}mbit")
+  tc qdisc add dev "$iface" parent "$parent" handle "$handle" "${args[@]}" 2>> "$error_file"
 }
 
 try_cake() {
@@ -477,42 +836,78 @@ try_cake() {
 }
 
 try_htb_fq() {
-  local iface="$1" rate="$2" burst_kb="$3" error_file="$4" maxrate="${5:-}"
+  local iface="$1" rate="$2" burst_kb="$3" error_file="$4" maxrate="${5:-}" mem="${6:-1024}"
   tc qdisc del dev "$iface" root 2>/dev/null || true
   tc qdisc add dev "$iface" root handle 1: htb default 10 r2q 1000 2> "$error_file" || return 1
   tc class add dev "$iface" parent 1: classid 1:10 htb rate "${rate}mbit" ceil "${rate}mbit" burst "${burst_kb}kb" cburst "${burst_kb}kb" quantum 15140 2>> "$error_file" || return 1
-  if [[ -n "$maxrate" ]]; then
-    tc qdisc add dev "$iface" parent 1:10 handle 10: fq maxrate "${maxrate}mbit" 2>> "$error_file" || return 1
-  else
-    tc qdisc add dev "$iface" parent 1:10 handle 10: fq 2>> "$error_file" || return 1
-  fi
+  add_fq_leaf "$iface" 1:10 10: "$maxrate" "$mem" "$error_file" || return 1
 }
 
 try_tbf_fq() {
-  local iface="$1" rate="$2" burst_kb="$3" error_file="$4" maxrate="${5:-}"
+  local iface="$1" rate="$2" burst_kb="$3" error_file="$4" maxrate="${5:-}" mem="${6:-1024}"
   tc qdisc del dev "$iface" root 2>/dev/null || true
   tc qdisc add dev "$iface" root handle 1: tbf rate "${rate}mbit" burst "${burst_kb}kb" latency 50ms 2> "$error_file" || return 1
-  if [[ -n "$maxrate" ]]; then
-    tc qdisc add dev "$iface" parent 1:1 handle 10: fq maxrate "${maxrate}mbit" 2>> "$error_file" || return 1
-  else
-    tc qdisc add dev "$iface" parent 1:1 handle 10: fq 2>> "$error_file" || return 1
-  fi
+  add_fq_leaf "$iface" 1:1 10: "$maxrate" "$mem" "$error_file" || return 1
 }
 
 try_fq_maxrate() {
-  local iface="$1" rate="$2" error_file="$3"
+  local iface="$1" rate="$2" error_file="$3" mem="${4:-1024}"
+  local limits limit flow_limit
+  limits="$(fq_leaf_limits "$mem")"
+  limit="${limits%% *}"; flow_limit="${limits##* }"
   tc qdisc del dev "$iface" root 2>/dev/null || true
-  tc qdisc add dev "$iface" root fq maxrate "${rate}mbit" 2> "$error_file" || return 1
+  tc qdisc add dev "$iface" root fq limit "$limit" flow_limit "$flow_limit" maxrate "${rate}mbit" 2> "$error_file" && return 0
+  tc qdisc add dev "$iface" root fq maxrate "${rate}mbit" 2>> "$error_file" || return 1
+}
+
+# Larger initial windows shave RTTs off the start of every connection, which
+# on a high-BDP cross-border path is exactly the play/seek feel. Rewritten
+# from the live default route so its other attributes survive.
+apply_initcwnd() {
+  local iface="$1" spec
+  local IFS=$' \t\n'
+  (( INITCWND == 0 )) && return 0
+  has ip || return 0
+  spec="$(ip route show default 2>/dev/null | head -n 1)"
+  [[ -n "$spec" ]] || return 0
+  [[ "$spec" == *" dev $iface"* || "$spec" == *" dev $iface" ]] || return 0
+  spec="$(printf '%s\n' "$spec" | sed -E 's/ initcwnd [0-9]+//g; s/ initrwnd [0-9]+//g')"
+  # shellcheck disable=SC2086
+  if ip route replace $spec initcwnd "$INITCWND" initrwnd "$INITCWND" 2>/dev/null; then
+    write_route_hook
+    return 0
+  fi
+  warn "无法设置 initcwnd（部分虚拟化平台不支持），已跳过；其余调优不受影响"
+  return 0
+}
+
+# DHCP renew or a link flap rewrites the default route and drops the option.
+write_route_hook() {
+  [[ -d /etc/networkd-dispatcher/routable.d ]] || return 0
+  {
+    printf '%s\n' '#!/bin/sh'
+    printf '%s\n' '# Generated by NetShape Manager - reapplies initcwnd after route changes.'
+    printf '%s\n' 'SPEC=$(ip route show default 2>/dev/null | head -n 1)'
+    printf '%s\n' '[ -n "$SPEC" ] || exit 0'
+    printf '%s\n' 'SPEC=$(printf "%s\\n" "$SPEC" | sed -E "s/ initcwnd [0-9]+//g; s/ initrwnd [0-9]+//g")'
+    printf 'ip route replace $SPEC initcwnd %s initrwnd %s 2>/dev/null\n' "$INITCWND" "$INITCWND"
+    printf '%s\n' 'exit 0'
+  } > "$ROUTE_HOOK" 2>/dev/null || return 0
+  chmod 0755 "$ROUTE_HOOK" 2>/dev/null || true
 }
 
 apply_shape() {
   need_root "$@"
   has tc || die "缺少 tc；请先安装 iproute2"
+  take_lock
   load_config
-  local iface burst_kb requested_mode selected_mode='' error_file detail
+  local iface burst_kb requested_mode selected_mode='' error_file detail mem
   iface="$(resolve_iface)"
-  burst_kb="$(calculate_htb_burst_kb "$RATE_MBPS")"
+  mem="$(mem_total_mb)"; (( mem > 0 )) || mem=1024
+  burst_kb="$(calculate_htb_burst_kb "$RATE_MBPS" "$BURST_MODE")"
   requested_mode="$SHAPER_MODE"
+  record_baseline_qdisc "$iface"
+  qdisc_guard "$iface" || die "已取消，未改动队列"
   has modprobe && {
     modprobe sch_cake >/dev/null 2>&1 || true
     modprobe sch_htb >/dev/null 2>&1 || true
@@ -521,7 +916,7 @@ apply_shape() {
   }
 
   if [[ "$SHAPING" == off ]]; then
-    restore_fq "$iface"
+    restore_default_qdisc "$iface"
     log "已取消人为限速，并恢复连接公平排队：$iface"
     return 0
   fi
@@ -529,7 +924,7 @@ apply_shape() {
   (( RATE_MBPS >= 10 && RATE_MBPS <= 100000 )) || die "无效限速：${RATE_MBPS}Mbps"
 
   if [[ "$LIMIT_MODE" == adaptive ]]; then
-    restore_fq "$iface"
+    restore_default_qdisc "$iface"
     SHAPER_MODE=fq
     save_config
     log "已启用不限速自适应：无整机总上限，每条 TCP 连接独立适应自己的网络"
@@ -542,58 +937,70 @@ apply_shape() {
     (( TOTAL_MBPS == 0 || (TOTAL_MBPS >= 10 && TOTAL_MBPS <= 100000) )) || die "无效整机总出口：${TOTAL_MBPS}Mbps（0 表示不限制）"
     if (( TOTAL_MBPS == 0 )); then
       info "正在设置单条 TCP 连接上限 ${RATE_MBPS} Mbps（整机总出口不限）"
-      if try_fq_maxrate "$iface" "$RATE_MBPS" "$error_file"; then
+      if try_fq_maxrate "$iface" "$RATE_MBPS" "$error_file" "$mem"; then
         SHAPER_MODE=fq
         save_config
         rm -f "$error_file"
+        verify_shaper "$iface" fq "$RATE_MBPS" || true
         log "已启用 fq maxrate：每条连接 ≤ ${RATE_MBPS} Mbps，多设备各自跑满自己的家宽"
         return 0
       fi
       detail="$(tail -n 1 "$error_file" 2>/dev/null || true)"
       rm -f "$error_file"
-      restore_fq "$iface"
+      restore_default_qdisc "$iface"
       die "当前 VPS 不支持单连接限速，已恢复不限速 fq。${detail:+ 内核返回：$detail}"
     fi
-    burst_kb="$(calculate_htb_burst_kb "$TOTAL_MBPS")"
+    burst_kb="$(calculate_htb_burst_kb "$TOTAL_MBPS" "$BURST_MODE")"
     info "正在设置：单条连接 ≤ ${RATE_MBPS} Mbps ＋ 整机总出口 ≤ ${TOTAL_MBPS} Mbps（网卡 ${iface}）"
     if [[ "$requested_mode" == auto || "$requested_mode" == cake || "$requested_mode" == htb ]] \
-      && try_htb_fq "$iface" "$TOTAL_MBPS" "$burst_kb" "$error_file" "$RATE_MBPS"; then
+      && try_htb_fq "$iface" "$TOTAL_MBPS" "$burst_kb" "$error_file" "$RATE_MBPS" "$mem"; then
       selected_mode=htb
     elif [[ "$requested_mode" != fq ]] \
-      && try_tbf_fq "$iface" "$TOTAL_MBPS" "$burst_kb" "$error_file" "$RATE_MBPS"; then
+      && try_tbf_fq "$iface" "$TOTAL_MBPS" "$burst_kb" "$error_file" "$RATE_MBPS" "$mem"; then
       selected_mode=tbf
-    elif try_fq_maxrate "$iface" "$RATE_MBPS" "$error_file"; then
+    elif try_fq_maxrate "$iface" "$RATE_MBPS" "$error_file" "$mem"; then
       selected_mode=fq
       warn "本机不支持总出口限速，已只保留单连接上限"
     else
       detail="$(tail -n 1 "$error_file" 2>/dev/null || true)"
       rm -f "$error_file"
-      restore_fq "$iface"
+      restore_default_qdisc "$iface"
       die "当前 VPS 不支持限速队列，已恢复不限速 fq。${detail:+ 内核返回：$detail}"
     fi
     SHAPER_MODE="$selected_mode"
     save_config
     rm -f "$error_file"
     case "$selected_mode" in
-      htb) log "已启用 HTB + fq maxrate：单条连接 ≤ ${RATE_MBPS} Mbps，整机合计 ≤ ${TOTAL_MBPS} Mbps" ;;
-      tbf) log "已启用 TBF + fq maxrate（兼容）：单条连接 ≤ ${RATE_MBPS} Mbps，整机合计 ≤ ${TOTAL_MBPS} Mbps" ;;
-      fq) log "已启用 fq maxrate：每条连接 ≤ ${RATE_MBPS} Mbps（无总上限）" ;;
+      htb)
+        verify_shaper "$iface" htb "$TOTAL_MBPS" || true
+        log "已启用 HTB + fq maxrate：单条连接 ≤ ${RATE_MBPS} Mbps，整机合计 ≤ ${TOTAL_MBPS} Mbps"
+        ;;
+      tbf)
+        verify_shaper "$iface" tbf "$TOTAL_MBPS" || true
+        log "已启用 TBF + fq maxrate（兼容）：单条连接 ≤ ${RATE_MBPS} Mbps，整机合计 ≤ ${TOTAL_MBPS} Mbps"
+        ;;
+      fq)
+        verify_shaper "$iface" fq "$RATE_MBPS" || true
+        log "已启用 fq maxrate：每条连接 ≤ ${RATE_MBPS} Mbps（无总上限）"
+        ;;
     esac
+    burst_note "$TOTAL_MBPS"
     return 0
   fi
 
   if [[ "$LIMIT_MODE" == perflow ]]; then
     info "正在设置单条 TCP 连接上限：${RATE_MBPS} Mbps（不会限制所有设备合计速度）"
-    if try_fq_maxrate "$iface" "$RATE_MBPS" "$error_file"; then
+    if try_fq_maxrate "$iface" "$RATE_MBPS" "$error_file" "$mem"; then
       SHAPER_MODE=fq
       save_config
       rm -f "$error_file"
+      verify_shaper "$iface" fq "$RATE_MBPS" || true
       log "已启用 fq maxrate：每条 TCP 连接最多 ${RATE_MBPS} Mbps，多设备可同时使用"
       return 0
     fi
     detail="$(tail -n 1 "$error_file" 2>/dev/null || true)"
     rm -f "$error_file"
-    restore_fq "$iface"
+    restore_default_qdisc "$iface"
     die "当前 VPS 不支持单连接限速，已恢复不限速 fq。${detail:+ 内核返回：$detail}"
   fi
 
@@ -606,13 +1013,13 @@ apply_shape() {
   fi
 
   if [[ -z "$selected_mode" && ( "$requested_mode" == auto || "$requested_mode" == cake || "$requested_mode" == htb ) ]]; then
-    if try_htb_fq "$iface" "$RATE_MBPS" "$burst_kb" "$error_file"; then
+    if try_htb_fq "$iface" "$RATE_MBPS" "$burst_kb" "$error_file" "" "$mem"; then
       selected_mode=htb
     fi
   fi
 
   if [[ -z "$selected_mode" && "$requested_mode" != fq ]]; then
-    if try_tbf_fq "$iface" "$RATE_MBPS" "$burst_kb" "$error_file"; then
+    if try_tbf_fq "$iface" "$RATE_MBPS" "$burst_kb" "$error_file" "" "$mem"; then
       selected_mode=tbf
     fi
   fi
@@ -620,7 +1027,7 @@ apply_shape() {
   if [[ -z "$selected_mode" ]]; then
     detail="$(tail -n 1 "$error_file" 2>/dev/null || true)"
     rm -f "$error_file"
-    restore_fq "$iface"
+    restore_default_qdisc "$iface"
     die "当前 VPS 不支持整机合计限速，已恢复不限速 fq。${detail:+ 内核返回：$detail}"
   fi
   rm -f "$error_file"
@@ -630,6 +1037,7 @@ apply_shape() {
     save_config
   fi
 
+  verify_shaper "$iface" "$selected_mode" "$RATE_MBPS" || true
   case "$selected_mode" in
     cake) log "已启用 CAKE：总出口 ${RATE_MBPS} Mbps，各设备先均分带宽，单设备多连接不会挤占其他设备" ;;
     htb) log "已启用 HTB + fq：整台机器所有连接合计不超过 ${RATE_MBPS} Mbps（按连接公平）" ;;
@@ -638,17 +1046,20 @@ apply_shape() {
       log "整台机器所有连接合计不超过 ${RATE_MBPS} Mbps"
       ;;
   esac
+  burst_note "$RATE_MBPS"
 }
 
 apply_all() {
   write_sysctl_profile
   apply_shape
+  apply_initcwnd "$(resolve_iface)"
 }
 
 set_profile() {
   local profile="${1:-}"
   [[ "$profile" =~ ^(speed|balanced|stable)$ ]] || die "档位必须是 speed、balanced 或 stable"
   need_root "$@"
+  take_lock
   load_config
   PROFILE="$profile"
   RATE_MBPS="$(recommended_rate "$LINE_MBPS" "$PROFILE")"
@@ -664,6 +1075,7 @@ set_rate() {
   is_uint "$rate" || die "速率必须是整数 Mbps，例如 430 或 850"
   (( rate >= 10 && rate <= 100000 )) || die "速率范围为 10-100000 Mbps"
   need_root "$@"
+  take_lock
   load_config
   RATE_MBPS="$rate"
   PROFILE="custom"
@@ -676,6 +1088,7 @@ set_rate() {
 
 set_adaptive() {
   need_root "$@"
+  take_lock
   load_config
   LIMIT_MODE="adaptive"
   PROFILE="custom"
@@ -694,6 +1107,7 @@ set_total_rate() {
   is_uint "$rate" || die "整机总出口必须是整数 Mbps，例如 2300；0 表示不限制"
   (( rate == 0 || (rate >= 10 && rate <= 100000) )) || die "范围为 0 或 10-100000 Mbps"
   need_root "$@"
+  take_lock
   load_config
   TOTAL_MBPS="$rate"
   LIMIT_MODE="combo"
@@ -710,6 +1124,7 @@ set_rtt() {
   is_uint "$rtt" || die "RTT 必须是整数毫秒，例如 160"
   (( rtt >= 1 && rtt <= 3000 )) || die "RTT 范围为 1-3000ms"
   need_root "$@"
+  take_lock
   load_config
   RTT_MS="$rtt"
   if [[ "$PROFILE" != custom ]]; then
@@ -725,6 +1140,7 @@ set_line() {
   is_uint "$line" || die "计算参考速度必须是整数 Mbps，例如 500 或 1000"
   (( line >= 10 && line <= 100000 )) || die "计算参考速度范围为 10-100000 Mbps"
   need_root "$@"
+  take_lock
   load_config
   LINE_MBPS="$line"
   [[ "$PROFILE" == custom ]] && PROFILE="$(default_profile_for_rtt "$RTT_MS")"
@@ -736,14 +1152,53 @@ set_line() {
 
 set_off() {
   need_root "$@"
+  take_lock
   load_config
   SHAPING="off"
   save_config
   apply_shape
 }
 
+set_burst() {
+  local mode="${1:-}"
+  [[ "$mode" =~ ^(policer|throughput)$ ]] || die "整形突发只能是 policer 或 throughput"
+  need_root "$@"
+  take_lock
+  load_config
+  BURST_MODE="$mode"
+  save_config
+  apply_shape
+  info "整形突发已切换为：$(burst_mode_label "$mode")"
+  info "两种模式请在真机上对比重传率（netshape status）后再定，没有普适答案。"
+}
+
+set_initcwnd() {
+  local value="${1:-}"
+  is_uint "$value" || die "初始窗口必须是整数，0 表示不修改路由"
+  (( value == 0 || (value >= 2 && value <= 64) )) || die "初始窗口范围为 0 或 2-64"
+  need_root "$@"
+  take_lock
+  load_config
+  INITCWND="$value"
+  save_config
+  if (( value == 0 )); then
+    rm -f "$ROUTE_HOOK"
+    local spec IFS=$' \t\n'
+    spec="$(ip route show default 2>/dev/null | head -n 1)"
+    if [[ "$spec" == *initcwnd* ]] && has ip; then
+      # shellcheck disable=SC2086
+      ip route replace $(printf '%s\n' "$spec" | sed -E 's/ initcwnd [0-9]+//g; s/ initrwnd [0-9]+//g') 2>/dev/null || true
+    fi
+    log "已停用 initcwnd 调整，默认路由恢复内核默认初始窗口"
+    return 0
+  fi
+  apply_initcwnd "$(resolve_iface)"
+  log "初始窗口已设为 initcwnd/initrwnd ${value}"
+}
+
 set_resume() {
   need_root "$@"
+  take_lock
   load_config
   SHAPING="on"
   save_config
@@ -859,6 +1314,13 @@ show_status() {
     esac
   fi
   printf '  队列模式:  %s\n' "$(queue_label "$SHAPING" "$LIMIT_MODE" "$SHAPER_MODE")"
+  printf '  整形突发:  %s\n' "$(burst_mode_label "$BURST_MODE")"
+  if (( INITCWND > 0 )); then
+    printf '  初始窗口:  initcwnd/initrwnd %s%s\n' "$INITCWND" \
+      "$( [[ "$(ip route show default 2>/dev/null | head -n 1)" == *initcwnd* ]] && printf '（已生效）' || printf '（未生效）' )"
+  else
+    printf '  初始窗口:  未启用\n'
+  fi
   printf '  TCP:       %s + %s / 缓冲建议 %s\n' "$cc" "$qdisc" "$(format_bytes "$tcp_max")"
   if [[ -n "$iface" ]] && has ip; then
     printf '  MTU:       %s\n' "$(ip -o link show dev "$iface" 2>/dev/null | sed -n 's/.* mtu \([0-9]*\).*/\1/p')"
@@ -870,12 +1332,17 @@ show_status() {
     tc -s class show dev "$iface" 2>/dev/null || true
   fi
   if has nstat; then
-    local pct
-    printf '\n%b▸ TCP 重传（自开机累计）%b\n' "$BOLD" "$RESET"
+    local pct live
+    printf '\n%b▸ TCP 重传%b\n' "$BOLD" "$RESET"
     pct="$(retrans_rate)"
-    if [[ -n "$pct" ]]; then
-      printf '  重传率 %s%%  —— %s\n' "$pct" "$(retrans_verdict "$pct")"
-      printf '  %b参考：<0.5%% 正常｜0.5-2%% 偏高｜>2%% 建议把单连接上限降一档%b\n' "$DIM" "$RESET"
+    [[ -n "$pct" ]] && printf '  自开机累计  %s%%%b（机器跑得越久越被稀释，仅供参考）%b\n' "$pct" "$DIM" "$RESET"
+    printf '  正在采样 %s 秒…\r' "$RETRANS_SAMPLE_SECS"
+    live="$(retrans_sample "$RETRANS_SAMPLE_SECS")"
+    if [[ -n "$live" ]]; then
+      printf '  实时 %ss     %s%%  —— %s\n' "$RETRANS_SAMPLE_SECS" "$live" "$(retrans_verdict "$live")"
+      printf '  %b参考：<0.1%% 干净｜0.1-1%% 偏高｜>1%% 基本是撞上了限速器%b\n' "$DIM" "$RESET"
+    else
+      printf '  实时 %ss     采样窗口内流量太少，无法判定（有人在看片时再测一次）\n' "$RETRANS_SAMPLE_SECS"
     fi
     nstat -asz 2>/dev/null | awk '$1 ~ /TcpOutSegs|TcpRetransSegs|TcpExtTCPLostRetransmit|TcpExtTCPFastRetrans/ {printf "  %s %s\n", $1, $2}' || true
   fi
@@ -1065,6 +1532,7 @@ write_service() {
 
 install_files() {
   need_root "$@"
+  take_lock
   [[ "$(uname -s)" == Linux ]] || die "仅支持 Linux"
   has ip || die "缺少 ip；请安装 iproute2"
   has tc || die "缺少 tc；请安装 iproute2"
@@ -1125,16 +1593,30 @@ parse_install_args() {
 
 uninstall_all() {
   need_root "$@"
+  take_lock
   load_config
   local iface
   iface="$(detect_iface)"; [[ "$IFACE" != auto ]] && iface="$IFACE"
-  [[ -n "$iface" ]] && has tc && restore_fq "$iface"
+  [[ -n "$iface" ]] && has tc && restore_baseline_qdisc "$iface"
   systemctl disable --now netshape-manager.service >/dev/null 2>&1 || true
-  rm -f "$SERVICE_FILE" "$SYSCTL_FILE" "$CONFIG_FILE"
+  rm -f "$SERVICE_FILE" "$SYSCTL_FILE" "$CONFIG_FILE" "$ROUTE_HOOK"
   [[ -L "$CLI_FILE" && "$(readlink "$CLI_FILE")" == "$INSTALL_FILE" ]] && rm -f "$CLI_FILE"
   rm -f "$INSTALL_FILE"
   systemctl daemon-reload 2>/dev/null || true
+  # Load whatever other files remain first, then write the snapshot back on
+  # top: sysctl --system alone leaves every tuned key live until reboot.
   has sysctl && sysctl --system >/dev/null 2>&1 || true
+  has sysctl && restore_snapshot
+  if [[ -n "$iface" ]] && has ip; then
+    local spec
+    spec="$(ip route show default 2>/dev/null | head -n 1)"
+    if [[ "$spec" == *initcwnd* ]]; then
+      local IFS=$' \t\n'
+      # shellcheck disable=SC2086
+      ip route replace $(printf '%s\n' "$spec" | sed -E 's/ initcwnd [0-9]+//g; s/ initrwnd [0-9]+//g') 2>/dev/null || true
+    fi
+  fi
+  rm -f "$SNAPSHOT_FILE" "$STATE_DIR/baseline-qdisc"
   log "已卸载 NetShape；Nginx 片段和备份保留，避免破坏现有反代"
 }
 
@@ -1181,7 +1663,7 @@ render_menu() {
   printf '  %b队列模式%b  %s\n' "$DIM" "$RESET" "$queue_text"
   pct="$(retrans_rate)"
   if [[ -n "$pct" ]]; then
-    printf '  %b重传率%b    %s%% —— %s\n' "$DIM" "$RESET" "$pct" "$(retrans_verdict "$pct")"
+    printf '  %b重传率%b    %s%%%b（自开机累计，实时判定按 8）%b\n' "$DIM" "$RESET" "$pct" "$DIM" "$RESET"
   fi
   drift="$(qdisc_drift "$(panel_iface)" "$SHAPING" "$LIMIT_MODE" "${SHAPER_MODE:-auto}" "$TOTAL_MBPS")"
   if [[ -n "$drift" ]]; then
@@ -1211,6 +1693,7 @@ render_menu() {
   printf '    %b8)%b 状态与诊断（重传、冲突、Nginx 审计）\n' "$BOLD" "$RESET"
   printf '    %b9)%b 修改到本地的大致延迟\n' "$BOLD" "$RESET"
   printf '    %ba)%b 重新应用当前配置（队列被覆盖或重启后用）\n' "$BOLD" "$RESET"
+  printf '    %bb)%b 切换整形突发模式%b（当前：%s，限速线路建议小突发）%b\n' "$BOLD" "$RESET" "$DIM" "$(burst_mode_short "${BURST_MODE:-policer}")" "$RESET"
   if [[ "$SHAPING" == off ]]; then
     printf '    %bp)%b %b恢复人为限速%b\n' "$BOLD" "$RESET" "$GREEN" "$RESET"
   else
@@ -1243,7 +1726,7 @@ menu() {
   while true; do
     load_config
     render_menu
-    if ! read -r -p '  请选择 [0-9 / a / p]: ' answer; then
+    if ! read -r -p '  请选择 [0-9 / a / b / p]: ' answer; then
       printf '\n'
       return 0
     fi
@@ -1282,6 +1765,13 @@ menu() {
         fi
         ;;
       a|A) run_action apply_all ;;
+      b|B)
+        if [[ "${BURST_MODE:-policer}" == policer ]]; then
+          run_action set_burst throughput
+        else
+          run_action set_burst policer
+        fi
+        ;;
       p|P)
         if [[ "$SHAPING" == off ]]; then run_action set_resume; else run_action set_off; fi
         ;;
@@ -1313,6 +1803,9 @@ NetShape Manager - 单连接上限 + 整机总出口 双层限速 SSH 面板
   netshape off             暂停限速，保留 fq
   netshape on              恢复限速（resume 同义）
   netshape apply           重新应用持久化配置
+  netshape burst policer   小突发整形（默认，贴合限速线路）
+  netshape burst throughput 大突发整形（10ms 令牌，仅干净直连线路）
+  netshape initcwnd 32     初始拥塞窗口（0 = 不修改默认路由）
   netshape status          查看机器、TCP、qdisc、class 和重传
   netshape diagnose        检查重复 sysctl/旧服务并审计 Nginx
   netshape nginx-snippet   生成 Emby 不限流片段（本机自建反代时用）
@@ -1340,6 +1833,8 @@ main() {
     rtt) set_rtt "${2:-}" ;;
     off) set_off ;;
     on|resume) set_resume ;;
+    burst) set_burst "${2:-}" ;;
+    initcwnd) set_initcwnd "${2:-}" ;;
     apply) apply_all ;;
     status) show_status ;;
     diagnose) diagnose ;;
