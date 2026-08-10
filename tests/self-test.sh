@@ -48,7 +48,7 @@ assert_eq 'fq maxrate（单条 TCP 连接上限）' "$(queue_label on combo fq)"
 # The whole point of TUNED_KEYS is that rollback covers everything tune sets.
 # Drift between the two is exactly the bug this list exists to prevent.
 declared_keys="$(printf '%s\n' $TUNED_KEYS | sort)"
-applied_keys="$(grep -oE 'append_sysctl "\$temp" [a-z]+(\.[a-z0-9_]+)+' "$ROOT/netshape-manager.sh" \
+applied_keys="$(grep -oE 'append_sysctl "\$temp" [a-z]+(\.[a-z0-9_-]+)+' "$ROOT/netshape-manager.sh" \
   | awk '{print $3}' | sort -u)"
 if [[ "$declared_keys" != "$applied_keys" ]]; then
   printf 'FAIL: TUNED_KEYS does not match append_sysctl calls\n' >&2
@@ -127,10 +127,48 @@ CONFIG_FILE="$cfg_dir/conf" load_config
 assert_eq 32 "$INITCWND" 'out-of-range INITCWND falls back to the default'
 rm -rf "$cfg_dir"
 
+# A landing box must not size receive buffers off the single-digit RTT to its
+# relay: the bulk arrives from distant origins on the other leg.
+assert_eq 160 "$(recv_buffer_rtt relay 160 150)" 'relay keeps its own RTT'
+assert_eq 5 "$(recv_buffer_rtt relay 5 150)" 'relay role never borrows the origin RTT'
+assert_eq 150 "$(recv_buffer_rtt landing 5 150)" 'landing sizes receive by the origin RTT'
+assert_eq 250 "$(recv_buffer_rtt landing 4 250)" 'landing honours a custom origin RTT'
+assert_eq 200 "$(recv_buffer_rtt landing 200 150)" 'landing keeps the larger of the two'
+# 5ms would pin a 1 Gbps landing box to the 8 MiB floor; 150ms gives it room.
+assert_eq 8388608 "$(calculate_tcp_max 1000 "$(recv_buffer_rtt relay 5 150)" 2048)" 'relay maths at 5ms hits the floor'
+assert_eq 37748736 "$(calculate_tcp_max 1000 "$(recv_buffer_rtt landing 5 150)" 2048)" 'landing keeps a real receive buffer'
+
+assert_eq '落地鸡' "$(role_short landing)" 'landing short label'
+assert_eq '中转/观看' "$(role_short relay)" 'relay short label'
+
 render_test() {
   SHAPING="$1" LIMIT_MODE="$2" RATE_MBPS="$3" RTT_MS=160 SHAPER_MODE="$4" TOTAL_MBPS="${5:-0}"
+  ROLE=relay ORIGIN_RTT_MS=150
   render_menu
 }
+landing_render_test() {
+  SHAPING="${1:-on}" LIMIT_MODE="${2:-adaptive}" TOTAL_MBPS="${3:-0}"
+  ROLE=landing RTT_MS=4 ORIGIN_RTT_MS=150 RATE_MBPS=1000 SHAPER_MODE=fq BURST_MODE=throughput
+  render_landing_menu
+}
+landing_out="$(landing_render_test)"
+[[ "$landing_out" == *'NetShape 落地鸡模式'* && "$landing_out" == *'不限制单连接'* ]] \
+  || { printf 'FAIL: landing panel header\n' >&2; exit 1; }
+printf 'PASS: landing panel header\n'
+[[ "$landing_out" == *'到中转机  4 ms'* && "$landing_out" == *'回源参考  150 ms'* ]] \
+  || { printf 'FAIL: landing panel shows both RTTs\n' >&2; exit 1; }
+printf 'PASS: landing panel shows both RTTs separately\n'
+# The home-broadband tiers are meaningless on an exit node and must not appear.
+[[ "$landing_out" != *'430 Mbps —— 500M 家宽'* && "$landing_out" != *'家宽档位'* ]] \
+  || { printf 'FAIL: landing panel still offers home-broadband tiers\n' >&2; exit 1; }
+printf 'PASS: landing panel drops the home-broadband tiers\n'
+landing_out="$(landing_render_test on total 900)"
+[[ "$landing_out" == *'整机 ≤ 900 Mbps'* ]] || { printf 'FAIL: landing panel total cap\n' >&2; exit 1; }
+printf 'PASS: landing panel shows the optional total cap\n'
+menu_out="$(render_test on combo 430 htb 2300)"
+[[ "$menu_out" == *'l) 切换为落地鸡模式'* && "$menu_out" == *'机器角色  中转/观看'* ]] \
+  || { printf 'FAIL: relay panel offers the landing switch\n' >&2; exit 1; }
+printf 'PASS: relay panel offers the landing switch\n'
 menu_out="$(render_test on combo 430 htb 2300)"
 [[ "$menu_out" == *'▸ 1) 430 Mbps'* && "$menu_out" == *'整机 ≤ 2300 Mbps'* ]] || { printf 'FAIL: combo 430 menu marker\n' >&2; exit 1; }
 printf 'PASS: combo 430 menu marker\n'

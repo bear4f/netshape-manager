@@ -5,7 +5,8 @@
 
 ## 能做什么
 
-- SSH 中文交互面板；安装后直接运行 `netshape`
+- SSH 中文交互面板；安装即进入面板选择机器角色，安装后直接运行 `netshape`
+- 两种机器角色：中转/观看机（跨境、双层限速）与落地鸡（同区域、不限单连接、缓冲按回源算）
 - 自动识别 CPU、RAM、Swap、默认出口网卡、MTU、内核和 BBR 支持
 - 双层限速：单条 TCP 连接压在观看设备家宽以下（500M 家宽→430/450，1G 家宽→850/900），整机总出口按 VPS 端口保护（2.5G 口→2300，1G 口→900，可设 0 不限）
 - 多设备在不同家宽环境同时观看时各自跑满自己的带宽，互不挤占；单条流不会打爆"VPS 到家"的跨境路径（这是重传暴涨和断流的根源）
@@ -42,6 +43,20 @@ OpenVZ/LXC 等受限容器可能不允许修改 sysctl 或 qdisc。脚本会报�
 curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install
 ```
 
+这条命令会先进入**安装面板**，让你选这台机器是做什么的：
+
+```
+  这台机器是做什么的？
+    1) 中转/观看机 —— 客户端在家宽另一端，跨境线路
+       逐项询问延迟、VPS 端口、家宽档位，套双层限速
+    2) 落地鸡 —— 与中转机同区域，延迟个位数，无跨境限速器
+       直接套用：不限单连接、按出口节点放大连接表、缓冲按回源计算
+    3) 只做基础 TCP 调优（BBR + fq，完全不限速）
+    0) 退出
+```
+
+选 1 进入原来的逐项向导；选 2 只问一个「端口多大」就配置完；选 3 只做 BBR + fq 不限速。
+
 安装完成后直接运行 SSH 面板：
 
 ```bash
@@ -50,10 +65,16 @@ sudo netshape
 
 ### 一键无人值守安装
 
-2.5G 口 VPS、观看设备 500M 家宽、160ms RTT 示例：
+2.5G 口中转机、观看设备 500M 家宽、160ms RTT：
 
 ```bash
 curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install --non-interactive --rate 430 --total 2300 --rtt 160
+```
+
+落地鸡（1G 口，不限总出口就把 `--total` 设 0）：
+
+```bash
+curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install --non-interactive --role landing --total 900
 ```
 
 ### 本地文件安装
@@ -107,8 +128,11 @@ sudo netshape
 
 - `a` 重新应用当前配置；
 - `b` 切换整形突发模式（小突发 / 大突发）；
+- `l` 切换为落地鸡模式；
 - `p` 暂停/恢复人为限速（暂停后仍保留 fq 公平排队）；
 - `0` 或 `q` 退出。
+
+落地鸡模式下面板会换成对应的菜单（见下文），按 `4` 切回中转模式。
 
 数字输入处按 `q` 或 Ctrl-D 可以放弃本次修改回到菜单；某一步失败（内核不支持某种队列、Nginx 配置有错等）只会打印原因并返回菜单，不会关掉面板。
 
@@ -131,11 +155,54 @@ sudo netshape apply              # 恢复持久化配置
 sudo netshape burst policer      # 小突发整形（默认）
 sudo netshape burst throughput   # 大突发整形（10ms 令牌）
 sudo netshape initcwnd 32        # 初始拥塞窗口（0 = 不修改默认路由）
+sudo netshape landing 0          # 切换为落地鸡模式（参数 = 整机总出口，0 = 不限）
+sudo netshape relay              # 切回中转/观看模式
+sudo netshape origin-rtt 150     # 落地鸡回源延迟参考
 ```
 
 裸数字（`netshape 430`）设置的是**单条连接上限**；整机总出口只能通过 `netshape total`。
 
 每次修改策略、上限或 RTT，都会重新计算 TCP 缓冲并应用 qdisc。只改整机总出口时不重写 sysctl，因为缓冲只由单连接上限和 RTT 决定。持久化配置位于 `/etc/netshape-manager.conf`。
+
+## 落地鸡模式
+
+落地鸡（出口节点）和中转机的约束几乎是相反的，所以它是一个独立角色，面板会换成对应的菜单：
+
+|  | 中转/观看机 | 落地鸡 |
+|---|---|---|
+| 客户端在哪 | 家宽另一端，跨境 | 就是隔壁的中转机 |
+| 到对端延迟 | 100-250ms | 个位数 ms |
+| 路径上有限速器 | 基本都有 | 基本没有 |
+| 单连接上限 | 压在家宽以下（430/850…） | **不限**（没有家宽要保护） |
+| 整机总出口 | 按 VPS 端口 | 可选，仅防打满端口 |
+| HTB 突发 | 小突发（躲限速器） | 大突发（没有限速器要躲） |
+| 接收缓冲按谁算 | 到客户端的 RTT | **回源 RTT，不是到中转机的个位数** |
+
+最后一行是这个模式存在的主要理由。落地鸡有两条腿：
+
+```
+远端源站  ──(任意 RTT，几十到两百多 ms，大流量从这边进来)──>  落地鸡
+落地鸡    ──(个位数 ms，自己的干净内网/同区域链路)────────>  中转机
+```
+
+如果照搬「用到对端的延迟算缓冲」，1 Gbps 的落地鸡按 5ms 只能得到 8 MiB 接收缓冲（下限兜底），**从远端源站拉数据会被这个值卡死**；按回源 150ms 算则是 36 MiB。发送缓冲仍按到中转机的个位数延迟计算，落在 8 MiB 下限上——那条腿本来也不需要更多。
+
+回源参考值默认 150ms，可以按你实际拉取的源站调整：
+
+```bash
+sudo netshape origin-rtt 250     # 源站更远
+```
+
+同时按出口节点的特点放大了连接相关的限制——出口节点的瓶颈通常是表和端口，不是带宽：
+
+- `ip_local_port_range` 放宽到 `10240 65535`
+- `tcp_max_tw_buckets`、`fs.file-max` 按内存分档抬高
+- `net.netfilter.nf_conntrack_max` 在 conntrack 已加载时一并抬高（表满会静默丢新连接，症状和上游故障一模一样）
+- `somaxconn` / `tcp_max_syn_backlog` 提到 8192
+
+不变的是：TCP Fast Open 和 ECN 仍然关着。落地鸡要连的是任意源站，不是可控的内网对端，这两项在陌生中间设备上出问题的代价远大于省下的那一个 RTT。
+
+两个角色随时可以互切，面板里中转模式按 `l`、落地模式按 `4`，或者用 `netshape landing` / `netshape relay`。
 
 ### 整形突发模式
 
@@ -161,7 +228,7 @@ sudo netshape initcwnd 32        # 初始拥塞窗口（0 = 不修改默认路�
 
 ### 卸载会恢复什么
 
-首次调优前会把 38 项内核参数的原值存到 `/var/lib/netshape-manager/pre-tune.snapshot`，`netshape uninstall` 按快照逐项写回——只删配置文件是不够的，那些值会一直留在运行中的内核里直到重启。根 qdisc 同样会恢复成安装前记录的类型（多队列网卡的 `mq` 交还给内核自动重建，不会被压成单个 fq）。
+首次调优前会把 42 项内核参数的原值存到 `/var/lib/netshape-manager/pre-tune.snapshot`，`netshape uninstall` 按快照逐项写回——只删配置文件是不够的，那些值会一直留在运行中的内核里直到重启。根 qdisc 同样会恢复成安装前记录的类型（多队列网卡的 `mq` 交还给内核自动重建，不会被压成单个 fq）。
 
 如果安装时机器上已经有 NetShape 的 sysctl 配置却没有快照（从旧版本原地升级），快照会记为非出厂状态并在卸载时明确告知。
 
