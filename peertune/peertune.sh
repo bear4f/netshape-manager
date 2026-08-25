@@ -260,10 +260,21 @@ function tomb(v,   n) {
   return n / 1000000
 }
 function ipof(a,   i) {
-  if (substr(a, 1, 1) == "[") { i = index(a, "]"); return (i > 2) ? substr(a, 2, i - 2) : a }
+  if (substr(a, 1, 1) == "[") { i = index(a, "]"); a = (i > 2) ? substr(a, 2, i - 2) : a }
+  else {
+    i = length(a)
+    while (i > 0 && substr(a, i, 1) != ":") i--
+    if (i > 1) a = substr(a, 1, i - 1)
+  }
+  # An IPv4 client reaching a dual-stack listener shows up as ::ffff:1.2.3.4.
+  # Left alone, the same person appears as two different peers.
+  if (substr(a, 1, 7) == "::ffff:") a = substr(a, 8)
+  return a
+}
+function portof(a,   i) {
   i = length(a)
   while (i > 0 && substr(a, i, 1) != ":") i--
-  return (i > 1) ? substr(a, 1, i - 1) : a
+  return (i > 0) ? substr(a, i + 1) : ""
 }
 /^[ \t]/ {
   if (peer == "") next
@@ -285,8 +296,12 @@ function ipof(a,   i) {
   if (rtt == "" || rtt <= 0 || dsegs <= 0) { peer = ""; next }
   if (minrtt == "" || minrtt <= 0) minrtt = rtt
   if (rttvar == "") rttvar = 0
-  printf "%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%d\t%d\t%.3f\t%d\n", \
-    local "|" peer, ipof(peer), cc, rtt, rttvar, minrtt, retr, dsegs, mbps, cwnd
+  # A relay also opens its own connections outward (CDNs, origins, updates).
+  # Those are not clients, and mixing them in makes the table unreadable, so
+  # the direction is decided by whether the local side is a listening port.
+  dir = (index(listen, " " portof(local) " ") > 0) ? "in" : "out"
+  printf "%s\t%s\t%s\t%.3f\t%.3f\t%.3f\t%d\t%d\t%.3f\t%d\t%s\n", \
+    local "|" peer, ipof(peer), cc, rtt, rttvar, minrtt, retr, dsegs, mbps, cwnd, dir
   peer = ""
   next
 }
@@ -297,7 +312,20 @@ function ipof(a,   i) {
 }
 '
 
-ss_parse() { awk "$SS_PARSE_AWK"; }
+# Ports this host listens on, so inbound connections can be told from the
+# ones the host itself opened.
+listening_ports() {
+  local ports
+  ports="$(ss -tlnH 2>/dev/null | awk '{
+    for (i = NF; i >= 1; i--) if ($i ~ /:[0-9]+$/) {
+      j = length($i); while (j > 0 && substr($i, j, 1) != ":") j--
+      print substr($i, j + 1); break
+    }
+  }' | sort -u | tr '\n' ' ')" || true
+  printf ' %s\n' "$ports"
+}
+
+ss_parse() { awk -v listen="${1:- }" "$SS_PARSE_AWK"; }
 
 # Aggregates the sample rows into one line per peer. Retransmissions are a
 # delta between the first and last sighting of each connection, not a lifetime
@@ -329,8 +357,8 @@ function groupof(ip,   i, c, out) {
 {
   key = $1; g = groupof($2); cc = $3
   rtt = $4 + 0; rttvar = $5 + 0; minrtt = $6 + 0
-  retr = $7 + 0; dsegs = $8 + 0; mbps = $9 + 0; cwnd = $10 + 0
-  if (!(key in firstseen)) { firstseen[key] = 1; fretr[key] = retr; fsegs[key] = dsegs; kgroup[key] = g }
+  retr = $7 + 0; dsegs = $8 + 0; mbps = $9 + 0; cwnd = $10 + 0; dir = $11
+  if (!(key in firstseen)) { firstseen[key] = 1; fretr[key] = retr; fsegs[key] = dsegs; kgroup[key] = g; kdir[key] = dir }
   lretr[key] = retr; lsegs[key] = dsegs
   n = ++cnt[g]
   rtts[g, n] = rtt
@@ -344,6 +372,7 @@ END {
   for (key in firstseen) {
     g = kgroup[key]
     conns[g]++
+    if (kdir[key] == "in") nin[g]++; else nout[g]++
     dr = lretr[key] - fretr[key]; ds = lsegs[key] - fsegs[key]
     # Fall back to the connection lifetime when it produced no traffic during
     # the window; labelled the same way because it is still that peer rate.
@@ -358,13 +387,22 @@ END {
     jit = (p50 > 0) ? (vsum[g] / n) / p50 : 0
     bloat = (gmin[g] > 0) ? p50 / gmin[g] : 1
     rpct = (sumsegs[g] > 0) ? sumretr[g] * 100 / sumsegs[g] : 0
-    printf "%s\t%d\t%s\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.4f\t%.1f\t%d\n", \
-      g, conns[g], ccname[g], p50, p95, gmin[g], jit, bloat, rpct, at(m, n, 0.50), gcwnd[g]
+    d = (nout[g] == 0) ? "in" : ((nin[g] == 0) ? "out" : "mix")
+    printf "%s\t%d\t%s\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.4f\t%.1f\t%d\t%d\t%s\n", \
+      g, conns[g], ccname[g], p50, p95, gmin[g], jit, bloat, rpct, at(m, n, 0.50), gcwnd[g], sumsegs[g], d
   }
 }
 '
 
 # ── 判定 ───────────────────────────────────────────────────────────────────
+
+# Below this, rtt and rttvar are dominated by timer granularity, interrupt
+# coalescing and scheduling — not by anything happening on the network. A
+# same-datacenter peer at 0.7ms will happily report a jitter ratio of 0.4.
+LOCAL_RTT_FLOOR_MS=5
+# A percentage over a handful of segments is noise: one retransmit out of
+# three is 33%, and it means nothing. Real streaming clients clear this easily.
+MIN_SEGS_FOR_RETRANS=1000
 
 # rtt / minrtt is how many times the path's own floor the queue has grown to.
 # It is the cleanest available signal for a bufferbloated access network,
@@ -398,27 +436,38 @@ retrans_verdict() {
 }
 
 # The whole point of collecting three independent signals is that their
-# combination says something none of them says alone.
+# combination says something none of them says alone. Both gates matter more
+# than the matrix does: without them a same-rack connection reads as a
+# wobbling radio link, and an idle one reads as a policed path.
 diagnose_peer() {
-  local bloat="${1:-1}" jitter="${2:-0}" retrans="${3:-0}"
-  awk -v b="$bloat" -v j="$jitter" -v r="$retrans" 'BEGIN {
+  local bloat="${1:-1}" jitter="${2:-0}" retrans="${3:-0}" rtt="${4:-999}" segs="${5:-999999}"
+  awk -v b="$bloat" -v j="$jitter" -v r="$retrans" -v t="$rtt" -v sg="$segs"       -v floor="$LOCAL_RTT_FLOOR_MS" -v minseg="$MIN_SEGS_FOR_RETRANS" 'BEGIN {
+    if (t < floor) {
+      print "同机房或本机出站连接（RTT < " floor "ms）——这个量级上抖动和膨胀都是计时噪声，不用管";
+      exit
+    }
+    trust_r = (sg >= minseg)
+    # An idle connection has too few RTT samples for rttvar to mean anything
+    # either, so this gates jitter and bloat as much as it gates loss.
+    if (!trust_r) { print "基本空闲，采样窗口内只发了 " sg " 段，数据不足以判断"; exit }
     if (b >= 3 && r < 1) {
       print "接入网排队膨胀（典型 5G/家宽上行）——瓶颈队列不在你的服务器上，服务端限速无效，靠 BBRv3 或降 pacing";
       exit
     }
     if (r >= 1 && b < 2) { print "路径丢包或限速器——重传高但没有排队，降单流速率有用"; exit }
     if (r >= 1 && b >= 2) { print "既排队又丢包——多半打穿了限速器，优先降速率"; exit }
-    if (j >= 0.3) { print "链路抖动大（无线调度/换手）——速率波动来自这里，不是你的配置"; exit }
+    if (j >= 0.3) { print "链路抖动大（无线接入或路径拥塞）——速率波动来自这里，不是你的配置"; exit }
     if (b >= 1.5) { print "轻微排队，可接受"; exit }
     print "健康";
   }'
 }
 
 collect_samples() {
-  local samples="$1" interval="$2" out="$3" i
+  local samples="$1" interval="$2" out="$3" i listen
+  listen="$(listening_ports)"
   : > "$out"
   for (( i = 1; i <= samples; i++ )); do
-    ss -tinH 2>/dev/null | ss_parse >> "$out" || true
+    ss -tinH 2>/dev/null | ss_parse "$listen" >> "$out" || true
     if (( i < samples )); then sleep "$interval"; fi
   done
   # Without this the loop leaks the last guard's status and errexit kills us.
@@ -427,13 +476,14 @@ collect_samples() {
 
 cmd_scan() {
   load_config
-  local samples="$SAMPLES" interval="$INTERVAL_S" group="$GROUP_BY" min_conn=1 raw agg
+  local samples="$SAMPLES" interval="$INTERVAL_S" group="$GROUP_BY" min_conn=1 show_all=0 raw agg
   while (( $# )); do
     case "$1" in
       --samples) [[ $# -ge 2 ]] || die "--samples 缺少值"; samples="$2"; shift 2 ;;
       --interval) [[ $# -ge 2 ]] || die "--interval 缺少值"; interval="$2"; shift 2 ;;
       --group) [[ $# -ge 2 ]] || die "--group 缺少值"; group="$2"; shift 2 ;;
       --min-conn) [[ $# -ge 2 ]] || die "--min-conn 缺少值"; min_conn="$2"; shift 2 ;;
+      --all) show_all=1; shift ;;
       *) die "未知参数：$1" ;;
     esac
   done
@@ -453,7 +503,7 @@ cmd_scan() {
     warn "采样窗口内没有任何活跃 TCP 连接（有流量时再测）"
     return 0
   fi
-  awk -v mode="$group" "$AGGREGATE_AWK" "$raw" | sort -t"$(printf '\t')" -k8,8gr > "$agg"
+  awk -v mode="$group" "$AGGREGATE_AWK" "$raw" | sort -t"$(printf '\t')" -k13,13 -k8,8gr > "$agg"
 
   printf '\n'
   # Hand-spaced: printf pads by character count, and every CJK header cell is
@@ -461,26 +511,52 @@ cmd_scan() {
   # ASCII data rows below.
   printf '  %b客户端                  连接  RTT50  RTT95   最低   抖动   膨胀    重传%%%b\n' "$BOLD" "$RESET"
   rule_light
-  local peer conns cc p50 p95 minrtt jit bloat rpct mbps cwnd shown=0 unhealthy=0
-  while IFS=$'\t' read -r peer conns cc p50 p95 minrtt jit bloat rpct mbps cwnd; do
+  local peer conns cc p50 p95 minrtt jit bloat rpct mbps cwnd segs dir
+  local shown=0 unhealthy=0 skipped_out=0 rpct_text quality
+  while IFS=$'\t' read -r peer conns cc p50 p95 minrtt jit bloat rpct mbps cwnd segs dir; do
     (( conns >= min_conn )) || continue
+    if [[ "$dir" == out ]] && (( show_all == 0 )); then
+      skipped_out=$((skipped_out + 1)); continue
+    fi
     shown=$((shown + 1))
-    local color="$GREEN"
-    if awk -v b="$bloat" -v r="$rpct" -v j="$jit" \
-      'BEGIN {exit !(b >= 3 || r >= 1 || j >= 0.3)}'; then
+    local color="$GREEN" local_peer=0
+    awk -v t="$p50" -v f="$LOCAL_RTT_FLOOR_MS" 'BEGIN {exit !(t < f)}' && local_peer=1
+    if (( segs >= MIN_SEGS_FOR_RETRANS )); then
+      rpct_text="$rpct"
+      quality="$(retrans_verdict "$rpct")"
+    else
+      # Showing a percentage here would be worse than showing nothing.
+      rpct_text="—"
+      quality="发包不足"
+    fi
+    if (( local_peer == 0 )) && (( segs >= MIN_SEGS_FOR_RETRANS )) \
+      && awk -v b="$bloat" -v r="$rpct" -v j="$jit" \
+        'BEGIN {exit !(b >= 3 || r >= 1 || j >= 0.3)}'; then
       color="$YELLOW"; unhealthy=$((unhealthy + 1))
     fi
     printf '  %b%-24s%b %4s %6s %6s %6s %6s %6s %8s\n' \
-      "$color" "$peer" "$RESET" "$conns" "$p50" "$p95" "$minrtt" "$jit" "$bloat" "$rpct"
-    printf '    %b%s ｜ %s ｜ %s ｜ %s ｜ 中位 %s Mbps ｜ cwnd %s%b\n' "$DIM" \
-      "$(bloat_verdict "$bloat")" "$(jitter_verdict "$jit")" "$(retrans_verdict "$rpct")" \
-      "$cc" "$mbps" "$cwnd" "$RESET"
-    printf '    %b→ %s%b\n' "$DIM" "$(diagnose_peer "$bloat" "$jit" "$rpct")" "$RESET"
+      "$color" "$peer" "$RESET" "$conns" "$p50" "$p95" "$minrtt" "$jit" "$bloat" "$rpct_text"
+    if (( local_peer == 1 )); then
+      printf '    %b同机房量级（%s ms）｜ %s ｜ %s ｜ 中位 %s Mbps ｜ %s 段%b\n' "$DIM" \
+        "$p50" "$quality" "$cc" "$mbps" "$segs" "$RESET"
+    elif (( segs < MIN_SEGS_FOR_RETRANS )); then
+      printf '    %b基本空闲 ｜ %s ｜ 中位 %s Mbps ｜ %s 段（抖动与膨胀都不可信）%b\n' "$DIM" \
+        "$cc" "$mbps" "$segs" "$RESET"
+    else
+      printf '    %b%s ｜ %s ｜ %s ｜ %s ｜ 中位 %s Mbps ｜ %s 段%b\n' "$DIM" \
+        "$(bloat_verdict "$bloat")" "$(jitter_verdict "$jit")" "$quality" \
+        "$cc" "$mbps" "$segs" "$RESET"
+    fi
+    printf '    %b→ %s%b\n' "$DIM" "$(diagnose_peer "$bloat" "$jit" "$rpct" "$p50" "$segs")" "$RESET"
   done < "$agg"
   rule_light
   if (( shown == 0 )); then
     warn "没有满足 --min-conn ${min_conn} 的客户端"
     return 0
+  fi
+  if (( skipped_out > 0 )); then
+    printf '  %b已隐藏 %s 个本机出站对端（CDN、源站、更新等，不是你的客户端）；--all 可以看%b\n' \
+      "$DIM" "$skipped_out" "$RESET"
   fi
   if (( unhealthy > 0 )); then
     printf '  %b%s/%s 个客户端有问题（黄色那几行）。这是一个分布，不是一个数——%b\n' \
@@ -490,8 +566,10 @@ cmd_scan() {
     printf '  %b%s 个客户端全部健康。%b\n' "$GREEN" "$shown" "$RESET"
   fi
   printf '  %b膨胀 = RTT50 / 该路径最低 RTT，>3 说明对端接入网在囤队列%b\n' "$DIM" "$RESET"
-  printf '  %b抖动 = rttvar / RTT50，>0.3 是无线链路的典型特征%b\n' "$DIM" "$RESET"
-  printf '  %b重传%% 取采样窗口内的增量，不是连接生命周期的平均值%b\n' "$DIM" "$RESET"
+  printf '  %b抖动 = rttvar / RTT50，>0.3 是无线链路的典型特征（RTT < %s ms 时是计时噪声）%b\n' \
+    "$DIM" "$LOCAL_RTT_FLOOR_MS" "$RESET"
+  printf '  %b重传%% 取采样窗口内的增量；窗口内不足 %s 段的显示为 —（样本太少没有意义）%b\n' \
+    "$DIM" "$MIN_SEGS_FOR_RETRANS" "$RESET"
 }
 
 # ── 调优 ───────────────────────────────────────────────────────────────────

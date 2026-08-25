@@ -61,15 +61,43 @@ assert_eq '偏高' "$(retrans_verdict 0.5)" 'elevated retrans'
 assert_eq '丢包重' "$(retrans_verdict 2.0)" 'heavy retrans'
 
 # The combination is what carries the diagnosis, so check the corners.
-[[ "$(diagnose_peer 4.0 0.4 0.02)" == *"接入网排队膨胀"* ]] || fail 'bloat without loss = access-network queue'
+# Signature: bloat jitter retrans% rtt segs
+[[ "$(diagnose_peer 4.0 0.4 0.02 180 50000)" == *"接入网排队膨胀"* ]] || fail 'bloat without loss = access-network queue'
 pass 'bloat without loss is diagnosed as access-network queueing'
-[[ "$(diagnose_peer 1.2 0.05 2.5)" == *"路径丢包或限速器"* ]] || fail 'loss without bloat = policer'
+[[ "$(diagnose_peer 1.2 0.05 2.5 180 50000)" == *"路径丢包或限速器"* ]] || fail 'loss without bloat = policer'
 pass 'loss without bloat is diagnosed as a policer'
-[[ "$(diagnose_peer 2.5 0.05 2.5)" == *"既排队又丢包"* ]] || fail 'both = punched through'
+[[ "$(diagnose_peer 2.5 0.05 2.5 180 50000)" == *"既排队又丢包"* ]] || fail 'both = punched through'
 pass 'loss with bloat is diagnosed as punching through'
-[[ "$(diagnose_peer 1.1 0.5 0.01)" == *"链路抖动大"* ]] || fail 'jitter alone = radio'
-pass 'jitter alone is diagnosed as a wobbling radio link'
-assert_eq '健康' "$(diagnose_peer 1.1 0.05 0.01)" 'clean peer is healthy'
+[[ "$(diagnose_peer 1.1 0.5 0.01 180 50000)" == *"链路抖动大"* ]] || fail 'jitter alone = radio'
+pass 'jitter alone is diagnosed as a wobbling link'
+assert_eq '健康' "$(diagnose_peer 1.1 0.05 0.01 180 50000)" 'clean peer is healthy'
+
+# Real-run regressions. A same-datacenter peer reports rtt 2.2/minrtt 1.0 and
+# a jitter ratio above 1.0 purely from timer granularity; without the floor it
+# was diagnosed as a wobbling radio link.
+[[ "$(diagnose_peer 2.29 1.251 0.0 2.2 900000)" == *"同机房"* ]] || fail 'sub-5ms peer must be gated'
+pass 'sub-5ms peer is not mistaken for a radio link'
+[[ "$(diagnose_peer 1.24 0.402 0.0 0.7 900000)" == *"同机房"* ]] || fail 'sub-1ms peer must be gated'
+pass 'sub-1ms peer is not mistaken for a radio link'
+# One retransmit out of three segments is 33% and means nothing.
+[[ "$(diagnose_peer 1.11 0.443 33.3 170 3)" != *"限速器"* ]] || fail 'tiny sample must not read as a policer'
+pass 'a 33% retransmission rate over 3 segments is not called a policer'
+[[ "$(diagnose_peer 1.04 0.132 12.5 782 8)" == *"数据不足"* ]] || fail 'idle peer should say so'
+pass 'an idle peer is reported as insufficient data'
+# rttvar off three RTT samples is no more trustworthy than a loss rate off
+# three segments, so the volume gate has to cover jitter and bloat as well.
+[[ "$(diagnose_peer 1.11 0.443 0.0 170 3)" == *"数据不足"* ]] || fail 'idle peer must not be called jittery'
+pass 'jitter over 3 segments is not called a wobbling link'
+[[ "$(diagnose_peer 4.5 0.05 0.0 170 12)" == *"数据不足"* ]] || fail 'idle peer must not be called bloated'
+pass 'bloat over 12 segments is not called access-network queueing'
+# With real volume behind them both must still fire.
+[[ "$(diagnose_peer 1.11 0.443 0.0 170 90000)" == *"链路抖动大"* ]] || fail 'real jitter must still fire'
+pass 'jitter with real volume is still reported'
+[[ "$(diagnose_peer 4.5 0.05 0.0 170 90000)" == *"接入网排队膨胀"* ]] || fail 'real bloat must still fire'
+pass 'bloat with real volume is still reported'
+# The same reading with real volume behind it must still fire.
+[[ "$(diagnose_peer 1.11 0.05 33.3 170 90000)" == *"限速器"* ]] || fail 'high loss with volume is a policer'
+pass 'high loss with real volume is still called a policer'
 
 # ── ss 解析 ────────────────────────────────────────────────────────────────
 # Real `ss -tin` layout: a socket line, then an indented info line.
@@ -79,7 +107,7 @@ ESTAB 0 0 10.0.0.1:443 203.0.113.5:51234
 ESTAB 0 0 10.0.0.1:443 198.51.100.9:44321
 	 cubic wscale:7,7 rto:1200 rtt:180.0/60.0 ato:40 mss:1448 cwnd:30 data_segs_out:9000 send 19.3Mbps pacing_rate 20Mbps delivery_rate 15.0Mbps retrans:2/900 minrtt:45.0
 EOF
-parsed="$(printf '%s\n' "$SS_SAMPLE" | ss_parse)"
+parsed="$(printf '%s\n' "$SS_SAMPLE" | ss_parse " 443 ")"
 assert_eq 2 "$(printf '%s\n' "$parsed" | wc -l | tr -d ' ')" 'parses both connections'
 row1="$(printf '%s\n' "$parsed" | head -1)"
 assert_eq '10.0.0.1:443|203.0.113.5:51234' "$(printf '%s' "$row1" | cut -f1)" 'connection key'
@@ -92,32 +120,41 @@ assert_eq '125' "$(printf '%s' "$row1" | cut -f7)" 'retrans takes the cumulative
 assert_eq '35900' "$(printf '%s' "$row1" | cut -f8)" 'data_segs_out'
 assert_eq '240.000' "$(printf '%s' "$row1" | cut -f9)" 'delivery_rate in Mbps'
 assert_eq '120' "$(printf '%s' "$row1" | cut -f10)" 'cwnd'
+assert_eq 'in' "$(printf '%s' "$row1" | cut -f11)" 'local port 443 is listening, so inbound'
+
+# The host opening its own connection to a CDN is not a client.
+outbound="$(printf 'ESTAB 0 0 10.0.0.1:51999 104.21.67.144:443\n\t bbr rtt:2.2/2.75 data_segs_out:900000 retrans:0/0 minrtt:1.0\n' | ss_parse " 443 ")"
+assert_eq 'out' "$(printf '%s' "$outbound" | cut -f11)" 'ephemeral local port is outbound'
+
+# A v4 client on a dual-stack listener must not become a second peer.
+mapped="$(printf 'ESTAB 0 0 [::ffff:10.0.0.1]:443 [::ffff:23.19.231.167]:44000\n\t bbr rtt:0.7/0.28 data_segs_out:5000 retrans:0/0 minrtt:0.5\n' | ss_parse " 443 ")"
+assert_eq '23.19.231.167' "$(printf '%s' "$mapped" | cut -f2)" 'IPv4-mapped peer normalises to plain IPv4'
 
 # ss drops the State column when a state filter is used; both must work.
-noshape="$(printf '0 0 10.0.0.1:443 203.0.113.5:51234\n\t bbr rtt:20.0/1.0 data_segs_out:100 retrans:0/1 minrtt:19.0\n' | ss_parse)"
+noshape="$(printf '0 0 10.0.0.1:443 203.0.113.5:51234\n\t bbr rtt:20.0/1.0 data_segs_out:100 retrans:0/1 minrtt:19.0\n' | ss_parse " 443 ")"
 assert_eq '203.0.113.5' "$(printf '%s' "$noshape" | cut -f2)" 'parses the stateless layout too'
 
 # Units other than Mbps have to be normalised or fast peers look idle.
-units="$(printf 'ESTAB 0 0 10.0.0.1:443 1.1.1.1:1\n\t bbr rtt:10.0/1.0 data_segs_out:10 retrans:0/0 delivery_rate 2.5Gbps minrtt:9.0\n' | ss_parse)"
+units="$(printf 'ESTAB 0 0 10.0.0.1:443 1.1.1.1:1\n\t bbr rtt:10.0/1.0 data_segs_out:10 retrans:0/0 delivery_rate 2.5Gbps minrtt:9.0\n' | ss_parse " 443 ")"
 assert_eq '2500.000' "$(printf '%s' "$units" | cut -f9)" 'Gbps normalised to Mbps'
-units="$(printf 'ESTAB 0 0 10.0.0.1:443 1.1.1.1:1\n\t bbr rtt:10.0/1.0 data_segs_out:10 retrans:0/0 delivery_rate 800Kbps minrtt:9.0\n' | ss_parse)"
+units="$(printf 'ESTAB 0 0 10.0.0.1:443 1.1.1.1:1\n\t bbr rtt:10.0/1.0 data_segs_out:10 retrans:0/0 delivery_rate 800Kbps minrtt:9.0\n' | ss_parse " 443 ")"
 assert_eq '0.800' "$(printf '%s' "$units" | cut -f9)" 'Kbps normalised to Mbps'
 
 # IPv6 peers are bracketed and full of colons; the port strip must not eat them.
-v6="$(printf 'ESTAB 0 0 [2001:db8::1]:443 [2001:db8:abcd:1::5]:9999\n\t bbr rtt:12.0/1.0 data_segs_out:50 retrans:0/0 minrtt:11.0\n' | ss_parse)"
+v6="$(printf 'ESTAB 0 0 [2001:db8::1]:443 [2001:db8:abcd:1::5]:9999\n\t bbr rtt:12.0/1.0 data_segs_out:50 retrans:0/0 minrtt:11.0\n' | ss_parse " 443 ")"
 assert_eq '2001:db8:abcd:1::5' "$(printf '%s' "$v6" | cut -f2)" 'IPv6 peer keeps its colons'
 
 # Sockets with no RTT yet or nothing sent carry no signal and must be dropped,
 # otherwise they drag every average toward zero.
-empty="$(printf 'ESTAB 0 0 10.0.0.1:443 1.1.1.1:1\n\t bbr data_segs_out:0 retrans:0/0\n' | ss_parse || true)"
+empty="$(printf 'ESTAB 0 0 10.0.0.1:443 1.1.1.1:1\n\t bbr data_segs_out:0 retrans:0/0\n' | ss_parse " 443 " || true)"
 assert_eq '' "$empty" 'idle socket with no rtt is skipped'
-empty="$(printf 'ESTAB 0 0 10.0.0.1:443 1.1.1.1:1\n\t bbr rtt:10.0/1.0 data_segs_out:0 retrans:0/0 minrtt:9.0\n' | ss_parse || true)"
+empty="$(printf 'ESTAB 0 0 10.0.0.1:443 1.1.1.1:1\n\t bbr rtt:10.0/1.0 data_segs_out:0 retrans:0/0 minrtt:9.0\n' | ss_parse " 443 " || true)"
 assert_eq '' "$empty" 'socket that never sent is skipped'
 
 # ── 聚合 ───────────────────────────────────────────────────────────────────
 # Two samples of one connection: retransmissions must come out as the delta
 # (150-100=50 over 11000-10000=1000 segs = 5%), not the lifetime 150/11000.
-agg_in="$(printf 'k1\t203.0.113.5\tbbr\t100.0\t10.0\t50.0\t100\t10000\t20.0\t40\nk1\t203.0.113.5\tbbr\t200.0\t30.0\t50.0\t150\t11000\t10.0\t40\n')"
+agg_in="$(printf 'k1\t203.0.113.5\tbbr\t100.0\t10.0\t50.0\t100\t10000\t20.0\t40\tin\nk1\t203.0.113.5\tbbr\t200.0\t30.0\t50.0\t150\t11000\t10.0\t40\tin\n')"
 agg="$(printf '%s' "$agg_in" | awk -v mode=ip "$AGGREGATE_AWK")"
 assert_eq '203.0.113.5' "$(printf '%s' "$agg" | cut -f1)" 'aggregates under the peer IP'
 assert_eq '1' "$(printf '%s' "$agg" | cut -f2)" 'counts one connection, not one per sample'
@@ -127,20 +164,24 @@ assert_eq '50.0' "$(printf '%s' "$agg" | cut -f6)" 'keeps the lowest minrtt'
 assert_eq '2.00' "$(printf '%s' "$agg" | cut -f8)" 'bloat is rtt p50 over the path floor'
 
 # /24 grouping folds one person's several devices into one row.
-net_in="$(printf 'k1\t203.0.113.5\tbbr\t100.0\t10.0\t50.0\t0\t1000\t20.0\t40\nk2\t203.0.113.77\tbbr\t120.0\t10.0\t60.0\t0\t1000\t20.0\t40\n')"
+net_in="$(printf 'k1\t203.0.113.5\tbbr\t100.0\t10.0\t50.0\t0\t1000\t20.0\t40\tin\nk2\t203.0.113.77\tbbr\t120.0\t10.0\t60.0\t0\t1000\t20.0\t40\tin\n')"
 net_agg="$(printf '%s' "$net_in" | awk -v mode=net "$AGGREGATE_AWK")"
 assert_eq 1 "$(printf '%s\n' "$net_agg" | wc -l | tr -d ' ')" 'the /24 collapses to one row'
 assert_eq '203.0.113.0/24' "$(printf '%s' "$net_agg" | cut -f1)" 'group is named as a /24'
 assert_eq '2' "$(printf '%s' "$net_agg" | cut -f2)" 'both connections counted in the group'
 ip_agg="$(printf '%s' "$net_in" | awk -v mode=ip "$AGGREGATE_AWK")"
 assert_eq 2 "$(printf '%s\n' "$ip_agg" | wc -l | tr -d ' ')" 'per-IP grouping keeps them apart'
-v6_agg="$(printf 'k1\t2001:db8:abcd:1::5\tbbr\t100.0\t10.0\t50.0\t0\t1000\t20.0\t40\n' | awk -v mode=net "$AGGREGATE_AWK")"
+v6_agg="$(printf 'k1\t2001:db8:abcd:1::5\tbbr\t100.0\t10.0\t50.0\t0\t1000\t20.0\t40\tin\n' | awk -v mode=net "$AGGREGATE_AWK")"
 assert_eq '2001:db8:abcd:1::/64' "$(printf '%s' "$v6_agg" | cut -f1)" 'IPv6 groups to a /64'
 
 # A connection idle across the whole window still reports its lifetime rate
 # rather than dividing by zero.
-idle_agg="$(printf 'k1\t1.1.1.1\tbbr\t10.0\t1.0\t9.0\t5\t1000\t1.0\t10\nk1\t1.1.1.1\tbbr\t10.0\t1.0\t9.0\t5\t1000\t1.0\t10\n' | awk -v mode=ip "$AGGREGATE_AWK")"
+idle_agg="$(printf 'k1\t1.1.1.1\tbbr\t10.0\t1.0\t9.0\t5\t1000\t1.0\t10\tin\nk1\t1.1.1.1\tbbr\t10.0\t1.0\t9.0\t5\t1000\t1.0\t10\tin\n' | awk -v mode=ip "$AGGREGATE_AWK")"
 assert_eq '0.5000' "$(printf '%s' "$idle_agg" | cut -f9)" 'idle connection falls back to lifetime rate'
+assert_eq '1000' "$(printf '%s' "$idle_agg" | cut -f12)" 'aggregate reports the segment count it judged on'
+assert_eq 'in' "$(printf '%s' "$idle_agg" | cut -f13)" 'aggregate carries the direction'
+mixed_agg="$(printf 'k1\t1.1.1.1\tbbr\t10.0\t1.0\t9.0\t0\t100\t1.0\t10\tin\nk2\t1.1.1.1\tbbr\t10.0\t1.0\t9.0\t0\t100\t1.0\t10\tout\n' | awk -v mode=ip "$AGGREGATE_AWK")"
+assert_eq 'mix' "$(printf '%s' "$mixed_agg" | cut -f13)" 'a peer seen both ways is marked mixed'
 
 # ── 配置 ───────────────────────────────────────────────────────────────────
 cfg="$(mktemp -d)"
