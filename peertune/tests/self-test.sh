@@ -99,6 +99,42 @@ pass 'bloat with real volume is still reported'
 [[ "$(diagnose_peer 1.11 0.05 33.3 170 90000)" == *"限速器"* ]] || fail 'high loss with volume is a policer'
 pass 'high loss with real volume is still called a policer'
 
+# Second real run: a 4G client at 208/344ms with 2.9% loss and bloat 1.27.
+# Loss without sustained queueing was being called a policer, and "lower the
+# per-flow rate" is close to useless against radio-layer loss.
+# Signature adds: tail_bloat spread
+[[ "$(diagnose_peer 1.27 0.214 2.9181 208.3 11960 2.09 1.65)" == *"无线接入层丢包"* ]] \
+  || fail '4G loss with a spread tail must not be called a policer'
+pass '4G loss with a spread tail is diagnosed as radio loss'
+# A real policer drops without moving latency, so it must still be called one.
+[[ "$(diagnose_peer 1.02 0.031 3.30 161.9 260000 1.05 1.05)" == *"限速器"* ]] \
+  || fail 'flat latency with loss is still a policer'
+pass 'flat latency with loss is still called a policer'
+# A calm median hiding a spiky tail deserves its own answer.
+[[ "$(diagnose_peer 1.2 0.05 0.0 180 90000 3.6 1.9)" == *"间歇性排队"* ]] \
+  || fail 'a spiky tail should be reported'
+pass 'a calm median with a spiky tail is reported as intermittent queueing'
+
+# ss prints minrtt to one decimal, so a same-host path reads 0.0 and the ratio
+# blew up to 101.86 on a real run. -1 is the not-computable sentinel.
+mr="$(printf 'k1\t1.1.1.1\tbbr\t0.7\t3.6\t0.0\t0\t5000\t8806.4\t10\tin\n' | awk -v mode=ip "$AGGREGATE_AWK")"
+assert_eq '-1.00' "$(printf '%s' "$mr" | cut -f8)" 'sub-0.1ms minrtt yields no bloat instead of a huge one'
+assert_eq '-1.00' "$(printf '%s' "$mr" | cut -f14)" 'the same applies to the tail ratio'
+# Ten samples of one connection whose RTT walks 164 -> 344, so p50 lands on
+# 208.3 and p95 on 343.8 — the real 4G client's shape.
+walk_file="$(mktemp)"
+i=0
+for r in 164.3 180.0 190.0 200.0 208.3 250.0 280.0 300.0 320.0 343.8; do
+  i=$((i + 1))
+  printf 'k1\t1.1.1.1\tbbr\t%s\t10.0\t164.3\t0\t%d\t1.0\t10\tin\n' "$r" $((1000 * i)) >> "$walk_file"
+done
+ok_bloat="$(awk -v mode=ip "$AGGREGATE_AWK" "$walk_file")"
+rm -f "$walk_file"
+assert_eq '208.3' "$(printf '%s' "$ok_bloat" | cut -f4)" 'p50 of the walk'
+assert_eq '343.8' "$(printf '%s' "$ok_bloat" | cut -f5)" 'p95 of the walk'
+assert_eq '1.27' "$(printf '%s' "$ok_bloat" | cut -f8)" 'median bloat matches the real 4G reading'
+assert_eq '2.09' "$(printf '%s' "$ok_bloat" | cut -f14)" 'tail bloat matches the real 4G reading'
+
 # ── ss 解析 ────────────────────────────────────────────────────────────────
 # Real `ss -tin` layout: a socket line, then an indented info line.
 read -r -d '' SS_SAMPLE <<'EOF' || true

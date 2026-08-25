@@ -385,11 +385,15 @@ END {
     sortarr(r, n); sortarr(m, n)
     p50 = at(r, n, 0.50); p95 = at(r, n, 0.95)
     jit = (p50 > 0) ? (vsum[g] / n) / p50 : 0
-    bloat = (gmin[g] > 0) ? p50 / gmin[g] : 1
+    # ss reports minrtt to one decimal, so a same-host path prints 0.0 and the
+    # ratio explodes (a real run produced a bloat of 101.86). Below 0.1ms there
+    # is no floor to divide by; -1 means "not computable" downstream.
+    bloat = (gmin[g] >= 0.1) ? p50 / gmin[g] : -1
+    tail = (gmin[g] >= 0.1) ? p95 / gmin[g] : -1
     rpct = (sumsegs[g] > 0) ? sumretr[g] * 100 / sumsegs[g] : 0
     d = (nout[g] == 0) ? "in" : ((nin[g] == 0) ? "out" : "mix")
-    printf "%s\t%d\t%s\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.4f\t%.1f\t%d\t%d\t%s\n", \
-      g, conns[g], ccname[g], p50, p95, gmin[g], jit, bloat, rpct, at(m, n, 0.50), gcwnd[g], sumsegs[g], d
+    printf "%s\t%d\t%s\t%.1f\t%.1f\t%.1f\t%.3f\t%.2f\t%.4f\t%.1f\t%d\t%d\t%s\t%.2f\n", \
+      g, conns[g], ccname[g], p50, p95, gmin[g], jit, bloat, rpct, at(m, n, 0.50), gcwnd[g], sumsegs[g], d, tail
   }
 }
 '
@@ -441,7 +445,10 @@ retrans_verdict() {
 # wobbling radio link, and an idle one reads as a policed path.
 diagnose_peer() {
   local bloat="${1:-1}" jitter="${2:-0}" retrans="${3:-0}" rtt="${4:-999}" segs="${5:-999999}"
-  awk -v b="$bloat" -v j="$jitter" -v r="$retrans" -v t="$rtt" -v sg="$segs"       -v floor="$LOCAL_RTT_FLOOR_MS" -v minseg="$MIN_SEGS_FOR_RETRANS" 'BEGIN {
+  local tail="${6:-$1}" spread="${7:-1}"
+  awk -v b="$bloat" -v j="$jitter" -v r="$retrans" -v t="$rtt" -v sg="$segs" \
+      -v tb="$tail" -v sp="$spread" \
+      -v floor="$LOCAL_RTT_FLOOR_MS" -v minseg="$MIN_SEGS_FOR_RETRANS" 'BEGIN {
     if (t < floor) {
       print "同机房或本机出站连接（RTT < " floor "ms）——这个量级上抖动和膨胀都是计时噪声，不用管";
       exit
@@ -454,8 +461,16 @@ diagnose_peer() {
       print "接入网排队膨胀（典型 5G/家宽上行）——瓶颈队列不在你的服务器上，服务端限速无效，靠 BBRv3 或降 pacing";
       exit
     }
-    if (r >= 1 && b < 2) { print "路径丢包或限速器——重传高但没有排队，降单流速率有用"; exit }
     if (r >= 1 && b >= 2) { print "既排队又丢包——多半打穿了限速器，优先降速率"; exit }
+    # A policer drops without adding delay variance: latency stays flat and
+    # only the loss rate moves. Radio loss comes with a spread tail and jitter,
+    # and is not a congestion signal — lowering the rate buys little.
+    if (r >= 1 && (j >= 0.15 || sp >= 1.4)) {
+      print "无线接入层丢包（4G/5G 典型）——没有持续排队，但丢包和延迟尾部都高。这类丢包不是拥塞信号，降速率收益有限，客户端播放器多缓冲更有效";
+      exit
+    }
+    if (r >= 1) { print "路径丢包或限速器——延迟很稳却在丢包，降单流速率有用"; exit }
+    if (tb >= 3) { print "间歇性排队——中位队列不深，但尾部涨到底噪的 " sprintf("%.1f", tb) " 倍，卡顿多半发生在这些尖峰上"; exit }
     if (j >= 0.3) { print "链路抖动大（无线接入或路径拥塞）——速率波动来自这里，不是你的配置"; exit }
     if (b >= 1.5) { print "轻微排队，可接受"; exit }
     print "健康";
@@ -513,7 +528,10 @@ cmd_scan() {
   rule_light
   local peer conns cc p50 p95 minrtt jit bloat rpct mbps cwnd segs dir
   local shown=0 unhealthy=0 skipped_out=0 rpct_text quality
-  while IFS=$'\t' read -r peer conns cc p50 p95 minrtt jit bloat rpct mbps cwnd segs dir; do
+  local tail spread bloat_text
+  while IFS=$'\t' read -r peer conns cc p50 p95 minrtt jit bloat rpct mbps cwnd segs dir tail; do
+    spread="$(awk -v a="$p95" -v b="$p50" 'BEGIN {printf "%.2f", (b > 0) ? a / b : 1}')"
+    if awk -v b="$bloat" 'BEGIN {exit !(b < 0)}'; then bloat_text="—"; else bloat_text="$bloat"; fi
     (( conns >= min_conn )) || continue
     if [[ "$dir" == out ]] && (( show_all == 0 )); then
       skipped_out=$((skipped_out + 1)); continue
@@ -530,12 +548,12 @@ cmd_scan() {
       quality="发包不足"
     fi
     if (( local_peer == 0 )) && (( segs >= MIN_SEGS_FOR_RETRANS )) \
-      && awk -v b="$bloat" -v r="$rpct" -v j="$jit" \
-        'BEGIN {exit !(b >= 3 || r >= 1 || j >= 0.3)}'; then
+      && awk -v b="$bloat" -v r="$rpct" -v j="$jit" -v tb="$tail" \
+        'BEGIN {exit !(b >= 3 || tb >= 3 || r >= 1 || j >= 0.3)}'; then
       color="$YELLOW"; unhealthy=$((unhealthy + 1))
     fi
     printf '  %b%-24s%b %4s %6s %6s %6s %6s %6s %8s\n' \
-      "$color" "$peer" "$RESET" "$conns" "$p50" "$p95" "$minrtt" "$jit" "$bloat" "$rpct_text"
+      "$color" "$peer" "$RESET" "$conns" "$p50" "$p95" "$minrtt" "$jit" "$bloat_text" "$rpct_text"
     if (( local_peer == 1 )); then
       printf '    %b同机房量级（%s ms）｜ %s ｜ %s ｜ 中位 %s Mbps ｜ %s 段%b\n' "$DIM" \
         "$p50" "$quality" "$cc" "$mbps" "$segs" "$RESET"
@@ -546,8 +564,11 @@ cmd_scan() {
       printf '    %b%s ｜ %s ｜ %s ｜ %s ｜ 中位 %s Mbps ｜ %s 段%b\n' "$DIM" \
         "$(bloat_verdict "$bloat")" "$(jitter_verdict "$jit")" "$quality" \
         "$cc" "$mbps" "$segs" "$RESET"
+      # The median can look calm while the tail is where the stalls live.
+      printf '    %b膨胀 中位 %s / P95 %s ｜ 延迟散布 P95÷P50 = %s%b\n' "$DIM" \
+        "$bloat_text" "$tail" "$spread" "$RESET"
     fi
-    printf '    %b→ %s%b\n' "$DIM" "$(diagnose_peer "$bloat" "$jit" "$rpct" "$p50" "$segs")" "$RESET"
+    printf '    %b→ %s%b\n' "$DIM" "$(diagnose_peer "$bloat" "$jit" "$rpct" "$p50" "$segs" "$tail" "$spread")" "$RESET"
   done < "$agg"
   rule_light
   if (( shown == 0 )); then
@@ -565,7 +586,7 @@ cmd_scan() {
   else
     printf '  %b%s 个客户端全部健康。%b\n' "$GREEN" "$shown" "$RESET"
   fi
-  printf '  %b膨胀 = RTT50 / 该路径最低 RTT，>3 说明对端接入网在囤队列%b\n' "$DIM" "$RESET"
+  printf '  %b膨胀 = RTT / 该路径最低 RTT；中位看持续排队，P95 看卡顿尖峰%b\n' "$DIM" "$RESET"
   printf '  %b抖动 = rttvar / RTT50，>0.3 是无线链路的典型特征（RTT < %s ms 时是计时噪声）%b\n' \
     "$DIM" "$LOCAL_RTT_FLOOR_MS" "$RESET"
   printf '  %b重传%% 取采样窗口内的增量；窗口内不足 %s 段的显示为 —（样本太少没有意义）%b\n' \
