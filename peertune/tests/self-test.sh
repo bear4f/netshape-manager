@@ -27,6 +27,18 @@ assert_eq cubic "$(pick_congestion_control 'reno cubic')" 'falls back to cubic'
 assert_eq cubic "$(pick_congestion_control 'cubic bbrplus')" 'does not match bbr as a substring'
 pick_congestion_control 'reno' >/dev/null 2>&1 && fail 'unknown-only list should fail' || pass 'reports failure when nothing usable'
 
+# BBRv3 has never been in mainline, so a stock kernel offering only "bbr" is
+# offering v1. modinfo carries no field that distinguishes them — the earlier
+# advice to check it was wrong, and provenance is what actually answers it.
+assert_eq v3 "$(bbr_variant 'reno cubic bbr bbr3' '6.1.0-50-amd64')" 'an explicit bbr3 wins'
+assert_eq v2 "$(bbr_variant 'reno cubic bbr bbr2' '6.1.0-50-amd64')" 'an explicit bbr2 wins'
+assert_eq v1 "$(bbr_variant 'reno cubic bbr' '6.1.0-50-amd64')" 'stock Debian 6.1 with bare bbr is v1'
+assert_eq v1 "$(bbr_variant 'reno cubic bbr' '5.15.0-91-generic')" 'stock Ubuntu with bare bbr is v1'
+assert_eq nonstock "$(bbr_variant 'reno cubic bbr' '6.6.7-x64v3-xanmod1')" 'XanMod is not assumed to be v1'
+assert_eq none "$(bbr_variant 'reno cubic' '6.1.0-50-amd64')" 'no bbr at all'
+[[ "$(bbr_variant_note v1)" == *"最大值滤波"* ]] || fail 'v1 note should explain the cost'
+pass 'the v1 note explains why it hurts on a lossy link'
+
 # ── 缓冲上限 ───────────────────────────────────────────────────────────────
 # 1 Gbps x 250ms x 2 = 62.5 MB, rounded up to whole MiB.
 assert_eq 62914560 "$(calc_buffer_max 1000 250 4096)" '1G/250ms buffer on 4G RAM'

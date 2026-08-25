@@ -175,6 +175,47 @@ available_cc() {
   tr -d '\n' < /proc/sys/net/ipv4/tcp_available_congestion_control
 }
 
+# BBRv3 has never been in mainline: it lives in XanMod and other out-of-tree
+# trees. So a stock distro kernel that offers only "bbr" is offering v1, and
+# no amount of poking at modinfo will say otherwise — the module carries no
+# version field that distinguishes them. The kernel's provenance is the answer.
+bbr_variant() {
+  local avail=" ${1:-} " release="${2:-}"
+  [[ -n "$release" ]] || release="$(uname -r 2>/dev/null || printf '')"
+  case "$avail" in
+    *" bbr3 "*) printf 'v3
+'; return 0 ;;
+    *" bbr2 "*) printf 'v2
+'; return 0 ;;
+  esac
+  case "$avail" in
+    *" bbr "*) ;;
+    *) printf 'none
+'; return 0 ;;
+  esac
+  case "$release" in
+    *xanmod*|*XanMod*|*XANMOD*) printf 'nonstock
+' ;;
+    *) printf 'v1
+' ;;
+  esac
+}
+
+bbr_variant_note() {
+  case "${1:-}" in
+    v3) printf 'BBRv3 —— 对无线/抖动链路最友好，无需再换
+' ;;
+    v2) printf 'BBRv2 —— 会响应丢包与 ECN，已经比 v1 好很多
+' ;;
+    v1) printf '%s
+' 'BBRv1（主线内核只有 v1）—— 带宽估计是约 10 个 RTT 的最大值滤波，链路变差后会抱着旧估值继续超发' ;;
+    nonstock) printf '非主线内核（XanMod 等），只报 bbr 但很可能已经是 v2/v3
+' ;;
+    *) printf '内核没有提供 BBR
+' ;;
+  esac
+}
+
 cc_note() {
   case "${1:-}" in
     bbr3) printf 'BBRv3，对无线/抖动链路最友好\n' ;;
@@ -888,8 +929,13 @@ cmd_doctor() {
     warn "内核提供了更适合抖动链路的 ${best}，当前却在用 ${cc}；跑 peertune apply 会切过去"
   fi
   if [[ "$cc" == bbr ]]; then
-    printf '  %b注意：内核只报 "bbr"，看不出是 v1 还是 v3。XanMod 等发行版把 v3 也叫 bbr。%b\n' "$DIM" "$RESET"
-    printf '  %b想确认可查：modinfo tcp_bbr 2>/dev/null | head -3%b\n' "$DIM" "$RESET"
+    local variant; variant="$(bbr_variant "$avail")"
+    printf '  内核版本:          %s\n' "$(uname -r 2>/dev/null || printf 'unknown')"
+    printf '  BBR 版本判定:      %s\n' "$(bbr_variant_note "$variant")"
+    if [[ "$variant" == v1 ]]; then
+      printf '  %b这正是 2%% 以上丢包 + 延迟尾部散开时最吃亏的版本。想要 v3 只能换内核%b\n' "$DIM" "$RESET"
+      printf '  %b（XanMod 等），peertune 不会替你装 —— 这是重改动，先确认收益再做%b\n' "$DIM" "$RESET"
+    fi
   fi
   iface="$(detect_iface)"; [[ "$IFACE" != auto ]] && iface="$IFACE"
   if [[ -n "$iface" ]] && has tc; then
@@ -905,9 +951,10 @@ cmd_doctor() {
   fi
   if netshape_conflict; then
     printf '\n'
-    warn "本机同时装有 netshape-manager —— 两者都会接管 root qdisc 和 sysctl。"
-    warn "同时存在时谁最后跑谁生效，而且面板都会显示自己那一套，看不出真实状态。"
-    info "只保留一个：sudo netshape uninstall，或 sudo peertune uninstall"
+    info "本机装有 netshape-manager，当前的限速由它在管。"
+    printf '  %bscan / doctor / status 是只读的，和它并存没有任何问题，可以一直这么用。%b\n' "$DIM" "$RESET"
+    printf '  %b只有 peertune tune / apply 会去接管 root qdisc 和 sysctl —— 那一步会先要求%b\n' "$DIM" "$RESET"
+    printf '  %b卸载 netshape，因为两套配置同时存在时谁最后跑谁生效，看不出真实状态。%b\n' "$DIM" "$RESET"
   fi
   printf '\n'
   coverage_note "$COVERAGE_RTT_MS"
