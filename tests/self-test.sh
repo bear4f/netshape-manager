@@ -15,6 +15,9 @@ assert_eq() {
   printf 'PASS: %s\n' "$label"
 }
 
+pass() { printf 'PASS: %s\n' "$1"; }
+fail() { printf 'FAIL: %s\n' "$1" >&2; exit 1; }
+
 assert_eq 450 "$(recommended_rate 500 speed)" '500M speed'
 assert_eq 430 "$(recommended_rate 500 balanced)" '500M balanced'
 assert_eq 400 "$(recommended_rate 500 stable)" '500M stable'
@@ -119,24 +122,59 @@ assert_eq none "$(nginx_snippet_state)" 'no snippet state without nginx'
 # which errexit would turn into the whole script dying.
 cfg_dir="$(mktemp -d)"
 printf 'RATE_MBPS=430\nBURST_MODE=evil\n' > "$cfg_dir/conf"
+# shellcheck disable=SC2218  # load_config comes from the sourced script above
 CONFIG_FILE="$cfg_dir/conf" load_config
 assert_eq policer "$BURST_MODE" 'bad BURST_MODE falls back to the default'
 assert_eq 430 "$RATE_MBPS" 'valid keys still load alongside a rejected one'
 printf 'INITCWND=9999\n' > "$cfg_dir/conf"
+# shellcheck disable=SC2218
 CONFIG_FILE="$cfg_dir/conf" load_config
 assert_eq 32 "$INITCWND" 'out-of-range INITCWND falls back to the default'
 rm -rf "$cfg_dir"
 
-# A landing box must not size receive buffers off the single-digit RTT to its
-# relay: the bulk arrives from distant origins on the other leg.
-assert_eq 160 "$(recv_buffer_rtt relay 160 150)" 'relay keeps its own RTT'
-assert_eq 5 "$(recv_buffer_rtt relay 5 150)" 'relay role never borrows the origin RTT'
-assert_eq 150 "$(recv_buffer_rtt landing 5 150)" 'landing sizes receive by the origin RTT'
-assert_eq 250 "$(recv_buffer_rtt landing 4 250)" 'landing honours a custom origin RTT'
-assert_eq 200 "$(recv_buffer_rtt landing 200 150)" 'landing keeps the larger of the two'
-# 5ms would pin a 1 Gbps landing box to the 8 MiB floor; 150ms gives it room.
-assert_eq 8388608 "$(calculate_tcp_max 1000 "$(recv_buffer_rtt relay 5 150)" 2048)" 'relay maths at 5ms hits the floor'
-assert_eq 37748736 "$(calculate_tcp_max 1000 "$(recv_buffer_rtt landing 5 150)" 2048)" 'landing keeps a real receive buffer'
+# ── 落地鸡：固定缓冲，与 RTT/BDP 无关 ─────────────────────────────────────
+# Measured on a real landing box: 1ms to every relay, and the ~1Gbps ceiling
+# was an upstream policer, not a buffer shortage. So the ceiling is fixed.
+assert_eq 33554432 "$(landing_buffer_cap 2048)" 'landing buffer is 32 MiB at 2G RAM'
+assert_eq 33554432 "$(landing_buffer_cap 1024)" 'landing buffer is 32 MiB at exactly 1G RAM'
+assert_eq 16777216 "$(landing_buffer_cap 512)" 'landing buffer drops to 16 MiB below 1G RAM'
+(( $(landing_buffer_cap 512) <= 16777216 )) || fail 'small-RAM landing cap must not exceed 16 MiB'
+pass 'small-RAM landing cap stays within 16 MiB'
+# The whole point: no origin RTT, however large, may move it.
+for _o in 150 250 500 3000; do
+  ORIGIN_RTT_MS="$_o"
+  (( $(landing_buffer_cap 2048) == 33554432 )) \
+    || fail "landing buffer moved with ORIGIN_RTT_MS=$_o"
+done
+pass 'landing buffer ignores ORIGIN_RTT_MS entirely'
+
+# ── 落地鸡：端口档位 → HTB cap（约 98% 线速）──────────────────────────────
+assert_eq 490 "$(landing_recommended_cap 500)" '500M port maps to 490'
+assert_eq 980 "$(landing_recommended_cap 1000)" '1G port maps to 980'
+assert_eq 1960 "$(landing_recommended_cap 2000)" '2G port maps to 1960'
+assert_eq 2450 "$(landing_recommended_cap 2500)" '2.5G port maps to 2450'
+assert_eq 392 "$(landing_recommended_cap 400)" 'an unlisted port falls back to 98%'
+# The old 1G->900 / 500->450 tiers threw away 8% of the line for nothing.
+(( $(landing_recommended_cap 1000) > 900 )) || fail 'the 1G tier must beat the old 900'
+pass 'the new tiers are less conservative than the old ones'
+
+# ── 落地鸡：小突发 ────────────────────────────────────────────────────────
+# ~1ms of tokens rounded to a 16 KiB boundary. A policer judges instantaneous
+# rate, and landing faces the provider's limiter directly.
+assert_eq 128 "$(landing_burst_kb 980)" '980M burst lands on 128 KiB'
+assert_eq 64 "$(landing_burst_kb 490)" '490M burst'
+assert_eq 240 "$(landing_burst_kb 1960)" '1960M burst'
+assert_eq 32 "$(landing_burst_kb 100)" 'burst floor is 32 KiB'
+assert_eq 256 "$(landing_burst_kb 100000)" 'burst ceiling is 256 KiB'
+# Must be far below relay's 10ms bucket at the same rate.
+(( $(landing_burst_kb 980) < $(calculate_htb_burst_kb 980 throughput) / 4 )) \
+  || fail 'landing burst should be far smaller than the throughput bucket'
+pass 'landing burst is far below the 10ms throughput bucket'
+
+# ── 落地鸡：浅 fq 叶子 ────────────────────────────────────────────────────
+assert_eq '10000 256' "$(landing_fq_leaf_limits)" 'landing fq leaf is 10000 / 256'
+# relay keeps its own memory-scaled depths, untouched.
+assert_eq '40960 8192' "$(fq_leaf_limits 2048)" 'relay fq leaf is unchanged'
 
 assert_eq '落地鸡' "$(role_short landing)" 'landing short label'
 assert_eq '中转/观看' "$(role_short relay)" 'relay short label'
@@ -147,24 +185,38 @@ render_test() {
   render_menu
 }
 landing_render_test() {
-  SHAPING="${1:-on}" LIMIT_MODE="${2:-adaptive}" TOTAL_MBPS="${3:-0}"
-  ROLE=landing RTT_MS=4 ORIGIN_RTT_MS=150 RATE_MBPS=1000 SHAPER_MODE=fq BURST_MODE=throughput
+  SHAPING="${1:-on}" LIMIT_MODE="${2:-total}" RATE_MBPS="${3:-980}"
+  ROLE=landing RTT_MS=1 ORIGIN_RTT_MS=150 SHAPER_MODE=htb BURST_MODE=policer
+  TOTAL_MBPS="$RATE_MBPS" INITCWND=0
   render_landing_menu
 }
 landing_out="$(landing_render_test)"
-[[ "$landing_out" == *'NetShape 落地鸡模式'* && "$landing_out" == *'不限制单连接'* ]] \
-  || { printf 'FAIL: landing panel header\n' >&2; exit 1; }
-printf 'PASS: landing panel header\n'
-[[ "$landing_out" == *'到中转机  4 ms'* && "$landing_out" == *'回源参考  150 ms'* ]] \
-  || { printf 'FAIL: landing panel shows both RTTs\n' >&2; exit 1; }
-printf 'PASS: landing panel shows both RTTs separately\n'
-# The home-broadband tiers are meaningless on an exit node and must not appear.
-[[ "$landing_out" != *'430 Mbps —— 500M 家宽'* && "$landing_out" != *'家宽档位'* ]] \
-  || { printf 'FAIL: landing panel still offers home-broadband tiers\n' >&2; exit 1; }
-printf 'PASS: landing panel drops the home-broadband tiers\n'
-landing_out="$(landing_render_test on total 900)"
-[[ "$landing_out" == *'整机 ≤ 900 Mbps'* ]] || { printf 'FAIL: landing panel total cap\n' >&2; exit 1; }
-printf 'PASS: landing panel shows the optional total cap\n'
+[[ "$landing_out" == *'NetShape · 落地鸡'* && "$landing_out" == *'HTB 出口'* ]] \
+  || fail 'landing panel header'
+pass 'landing panel leads with the HTB cap'
+[[ "$landing_out" == *'980 Mbps'* && "$landing_out" == *'到中转     1 ms'* ]] \
+  || fail 'landing panel shows cap and relay RTT'
+pass 'landing panel shows the aggregate cap and the 1ms relay RTT'
+[[ "$landing_out" == *'burst 128 KiB'* && "$landing_out" == *'fq leaf 10000 / 256'* ]] \
+  || fail 'landing panel shows burst and leaf depth'
+pass 'landing panel shows burst and fq leaf depth'
+[[ "$landing_out" == *'initcwnd'*'关闭'* ]] || fail 'landing panel should show initcwnd off'
+pass 'landing panel shows initcwnd disabled'
+[[ "$landing_out" == *'32 MiB'* ]] || fail 'landing panel should show the fixed buffer'
+pass 'landing panel shows the fixed 32 MiB buffer'
+# The home-broadband tiers and the deprecated origin RTT are both gone.
+[[ "$landing_out" != *'家宽档位'* && "$landing_out" != *'430 Mbps —— 500M 家宽'* ]] \
+  || fail 'landing panel still offers home-broadband tiers'
+pass 'landing panel drops the home-broadband tiers'
+[[ "$landing_out" != *'回源参考'* ]] || fail 'landing panel should not show the deprecated origin RTT'
+pass 'landing panel no longer shows the deprecated origin RTT'
+[[ "$landing_out" == *'u)'*'卸载'* ]] || fail 'landing panel should offer uninstall'
+pass 'landing panel offers uninstall'
+landing_out="$(landing_render_test on adaptive 1000)"
+[[ "$landing_out" == *'未设上限'* && "$landing_out" == *'没有 aggregate 上限'* ]] \
+  || fail 'unshaped landing must warn'
+pass 'landing without an aggregate cap warns about the upstream policer'
+
 menu_out="$(render_test on combo 430 htb 2300)"
 [[ "$menu_out" == *'l) 切换为落地鸡模式'* && "$menu_out" == *'机器角色  中转/观看'* ]] \
   || { printf 'FAIL: relay panel offers the landing switch\n' >&2; exit 1; }
@@ -350,5 +402,258 @@ audit_out="$(nginx_audit 2>&1)"
 [[ "$audit_out" == *'片段已被 include'* && "$audit_out" == *'已找到 proxy_buffering off'* ]] || { printf 'FAIL: audit confirms applied snippet\n' >&2; exit 1; }
 printf 'PASS: audit confirms applied snippet\n'
 rm -rf "$audit_dir"
+
+# ── 落地鸡：sysctl 只写该写的 ─────────────────────────────────────────────
+prof_dir="$(mktemp -d)"
+_orig_sysctl_file="$SYSCTL_FILE"; _orig_state="$STATE_DIR"
+SYSCTL_FILE="$prof_dir/99-landing.conf"; STATE_DIR="$prof_dir"
+SNAPSHOT_FILE="$prof_dir/snap"
+has() { [[ "$1" != sysctl && "$1" != modprobe ]]; }
+choose_congestion_control() { printf 'bbr\n'; }
+mem_total_mb() { printf '%s\n' "${TEST_MEM_MB:-2048}"; }
+write_landing_sysctl_profile >/dev/null 2>&1
+landing_conf="$(cat "$SYSCTL_FILE")"
+
+# Every key the brief says landing must set.
+for _k in net.ipv4.tcp_congestion_control net.core.default_qdisc \
+          net.core.rmem_max net.core.wmem_max net.ipv4.tcp_rmem net.ipv4.tcp_wmem \
+          net.ipv4.tcp_moderate_rcvbuf net.ipv4.tcp_window_scaling \
+          net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_no_metrics_save \
+          net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing net.ipv4.tcp_ecn \
+          net.core.netdev_max_backlog net.ipv4.udp_rmem_min net.ipv4.udp_wmem_min; do
+  [[ "$landing_conf" == *"$_k "* ]] || fail "landing profile is missing $_k"
+done
+pass 'landing writes every key it is supposed to'
+[[ "$landing_conf" == *'net.core.rmem_max = 33554432'* ]] || fail 'landing rmem_max should be 32 MiB'
+[[ "$landing_conf" == *'net.ipv4.tcp_rmem = 4096 87380 33554432'* ]] || fail 'landing tcp_rmem'
+[[ "$landing_conf" == *'net.ipv4.tcp_wmem = 4096 16384 33554432'* ]] || fail 'landing tcp_wmem'
+[[ "$landing_conf" == *'net.ipv4.tcp_fastopen = 3'* ]] || fail 'landing enables TFO'
+[[ "$landing_conf" == *'net.ipv4.udp_rmem_min = 8192'* ]] || fail 'landing udp_rmem_min'
+pass 'landing buffer values match the measured baseline'
+
+# The forbidden list: system-policy knobs a speed tool must not own.
+for _k in net.ipv4.tcp_mem net.ipv4.tcp_adv_win_scale net.ipv4.tcp_notsent_lowat \
+          net.ipv4.tcp_fastopen_blackhole_timeout_sec net.ipv4.tcp_tw_reuse \
+          net.ipv4.tcp_fin_timeout net.ipv4.tcp_keepalive_time \
+          net.ipv4.tcp_keepalive_intvl net.ipv4.tcp_keepalive_probes \
+          net.ipv4.tcp_max_tw_buckets net.ipv4.ip_local_port_range \
+          net.core.somaxconn net.ipv4.tcp_max_syn_backlog \
+          net.netfilter.nf_conntrack_max vm.min_free_kbytes; do
+  [[ "$landing_conf" != *"$_k"* ]] || fail "landing must not write $_k"
+done
+pass 'landing writes none of the forbidden keys'
+
+TEST_MEM_MB=512
+write_landing_sysctl_profile >/dev/null 2>&1
+[[ "$(cat "$SYSCTL_FILE")" == *'net.core.rmem_max = 16777216'* ]] \
+  || fail 'small-RAM landing should cap at 16 MiB'
+pass 'landing drops to 16 MiB on a sub-1G box'
+unset TEST_MEM_MB
+
+# Relay must still emit the full set it always did.
+ROLE=relay RATE_MBPS=430 RTT_MS=160 LINE_MBPS=500
+need_root() { :; }
+take_lock() { :; }
+take_snapshot() { :; }
+load_config() { :; }
+release_unmanaged_keys() { :; }
+swap_total_mb() { printf '2048\n'; }
+write_sysctl_profile >/dev/null 2>&1
+relay_conf="$(cat "$SYSCTL_FILE")"
+for _k in net.ipv4.tcp_mem net.ipv4.tcp_adv_win_scale net.ipv4.tcp_notsent_lowat \
+          net.ipv4.tcp_tw_reuse net.ipv4.tcp_fin_timeout net.ipv4.tcp_keepalive_time \
+          net.core.somaxconn net.ipv4.ip_local_port_range; do
+  [[ "$relay_conf" == *"$_k "* ]] || fail "relay lost $_k"
+done
+pass 'relay still writes its full original key set'
+[[ "$relay_conf" == *'net.ipv4.tcp_fastopen = 0'* ]] || fail 'relay keeps TFO off'
+pass 'relay keeps TCP Fast Open off for cross-border middleboxes'
+SYSCTL_FILE="$_orig_sysctl_file"; STATE_DIR="$_orig_state"
+rm -rf "$prof_dir"
+
+# ── 落地鸡：fq 叶子在老内核上的回退 ───────────────────────────────────────
+# Rejecting limit/flow_limit must not be read as "HTB unsupported".
+tc_log="$(mktemp)"
+has() { return 0; }
+tc() {
+  local IFS=' '
+  local line="$*"
+  printf '%s\n' "$line" >> "$tc_log"
+  [[ "${TC_REJECT_FQ_LIMITS:-0}" == 1 && "$line" == *flow_limit* ]] && return 1
+  return 0
+}
+: > "$tc_log"
+add_landing_fq_leaf eth-test 1:10 10: /dev/null
+assert_eq 'qdisc add dev eth-test parent 1:10 handle 10: fq limit 10000 flow_limit 256' \
+  "$(head -1 "$tc_log")" 'landing fq leaf uses bare integers, no trailing p'
+: > "$tc_log"
+TC_REJECT_FQ_LIMITS=1
+add_landing_fq_leaf eth-test 1:10 10: /dev/null || fail 'fq leaf should fall back'
+assert_eq 'qdisc add dev eth-test parent 1:10 handle 10: fq' \
+  "$(sed -n 2p "$tc_log")" 'landing fq leaf falls back to plain fq'
+unset TC_REJECT_FQ_LIMITS
+# A failing HTB step must not leave half a class behind.
+: > "$tc_log"
+tc() {
+  local IFS=' '
+  printf '%s\n' "$*" >> "$tc_log"
+  [[ "$1 $2" == "class add" ]] && return 1
+  return 0
+}
+try_landing_htb eth-test 980 128 /dev/null && fail 'a failing class add should fail the attempt'
+[[ "$(tail -1 "$tc_log")" == 'qdisc del dev eth-test root' ]] \
+  || fail 'a failed HTB attempt must tear the root down'
+pass 'a failed HTB attempt leaves no half-built class'
+rm -f "$tc_log"
+
+# ── 落地鸡：切换过来会清掉 initcwnd ───────────────────────────────────────
+route_log="$(mktemp)"
+has() { [[ "$1" == ip ]]; }
+ROUTE_HOOK="$(mktemp)"
+ip() {
+  if [[ "$1 $2" == "route show" ]]; then printf '%s\n' "$ROUTE_SPEC"; return 0; fi
+  if [[ "$1 $2" == "route replace" ]]; then shift 2; local IFS=' '; printf '%s\n' "$*" >> "$route_log"; return 0; fi
+  return 0
+}
+ROUTE_SPEC='default via 10.0.0.1 dev eth0 proto dhcp metric 100 initcwnd 32 initrwnd 32'
+clear_initcwnd >/dev/null 2>&1
+assert_eq 'default via 10.0.0.1 dev eth0 proto dhcp metric 100' "$(cat "$route_log")" \
+  'switching to landing strips initcwnd and initrwnd from the default route'
+[[ ! -e "$ROUTE_HOOK" ]] || fail 'the networkd hook must be removed too'
+pass 'the initcwnd route hook is removed as well'
+: > "$route_log"
+ROUTE_SPEC='default via 10.0.0.1 dev eth0 proto dhcp metric 100'
+clear_initcwnd >/dev/null 2>&1
+assert_eq '' "$(cat "$route_log")" 'a route without initcwnd is left alone'
+rm -f "$route_log"
+
+# ── 落地鸡：set_landing 的最终状态 ────────────────────────────────────────
+# Re-source to restore every function earlier sections stubbed out: this block
+# needs a real load_config/save_config round trip to prove what set_landing
+# actually persists. (unset -f would delete them, not restore them.)
+. "$ROOT/netshape-manager.sh"
+cfg2="$(mktemp -d)"
+CONFIG_FILE="$cfg2/conf"
+has() { return 1; }
+need_root() { :; }
+take_lock() { :; }
+apply_all() { :; }
+default_config
+ROLE=relay RTT_MS=160 INITCWND=32
+save_config
+set_landing 980 >/dev/null 2>&1
+load_config
+assert_eq landing "$ROLE" 'set_landing switches the role'
+assert_eq total "$LIMIT_MODE" 'set_landing uses an aggregate limit mode'
+assert_eq htb "$SHAPER_MODE" 'set_landing pins HTB rather than auto'
+assert_eq policer "$BURST_MODE" 'set_landing uses the small burst'
+assert_eq 0 "$INITCWND" 'set_landing disables initcwnd'
+assert_eq 1 "$RTT_MS" 'landing defaults to a 1ms relay RTT'
+assert_eq 980 "$RATE_MBPS" 'set_landing stores the aggregate cap'
+# An existing landing box keeps a hand-set RTT when the cap changes.
+RTT_MS=2; save_config
+set_landing 1960 >/dev/null 2>&1
+load_config
+assert_eq 2 "$RTT_MS" 'changing the cap does not reset a hand-set landing RTT'
+assert_eq 1960 "$RATE_MBPS" 'the new cap is stored'
+# Unlimited landing is allowed but must not pretend to have a shaper.
+set_landing 0 >/dev/null 2>&1
+load_config
+assert_eq adaptive "$LIMIT_MODE" 'an unlimited landing box is adaptive'
+assert_eq fq "$SHAPER_MODE" 'an unlimited landing box records fq'
+# Going back to relay restores relay-shaped defaults.
+set_relay_role >/dev/null 2>&1
+load_config
+assert_eq relay "$ROLE" 'set_relay_role switches back'
+assert_eq 430 "$RATE_MBPS" 'returning to relay restores a per-flow default'
+assert_eq 160 "$RTT_MS" 'returning to relay restores a cross-border RTT'
+assert_eq 32 "$INITCWND" 'returning to relay restores initcwnd'
+rm -rf "$cfg2"
+
+# ── 二次审查发现的三个 bug，各配一条回归 ─────────────────────────────────
+
+# 1. softnet_stat is hex, and strtonum() is gawk-only. On Debian's mawk the
+#    old expression aborted and read 0, which then claimed "no local drops"
+#    regardless of the truth. The replacement must parse hex on any awk.
+softnet_fixture="$(mktemp)"
+printf '00000001 0000002a 00000000 00000000\n0000000b 00000016 00000000 00000000\n' > "$softnet_fixture"
+hex_sum="$(awk '
+  function hex(x,   i, c, v, d) {
+    v = 0; x = tolower(x)
+    for (i = 1; i <= length(x); i++) {
+      d = index("0123456789abcdef", substr(x, i, 1)) - 1
+      if (d < 0) return v
+      v = v * 16 + d
+    }
+    return v
+  }
+  {s += hex($2)} END {printf "%d\n", s}' "$softnet_fixture")"
+# 0x2a = 42, 0x16 = 22 -> 64
+assert_eq 64 "$hex_sum" 'softnet hex columns parse without gawk extensions'
+# Comments may name it; code may not call it.
+grep -v '^[[:space:]]*#' "$ROOT/netshape-manager.sh" | grep -q 'strtonum(' \
+  && fail 'strtonum() is a gawk extension and must not be called'
+pass 'no gawk-only builtins remain in the script'
+rm -f "$softnet_fixture"
+
+# 2. release_unmanaged_keys must never overwrite a value somebody else changed
+#    after NetShape wrote it. Restoring the factory value there would quietly
+#    undo the user's own tuning.
+rel_dir="$(mktemp -d)"
+_sf="$SYSCTL_FILE"; _snap="$SNAPSHOT_FILE"
+SYSCTL_FILE="$rel_dir/ns.conf"; SNAPSHOT_FILE="$rel_dir/snap"
+printf 'net.ipv4.tcp_fin_timeout = 15\nnet.ipv4.tcp_keepalive_time = 600\n' > "$SYSCTL_FILE"
+printf '# PRISTINE=1\nnet.ipv4.tcp_fin_timeout=60\nnet.ipv4.tcp_keepalive_time=7200\n' > "$SNAPSHOT_FILE"
+rel_log="$rel_dir/log"
+has() { [[ "$1" == sysctl ]]; }
+# keepalive still holds what we wrote (600); fin_timeout was changed to 30.
+sysctl() {
+  if [[ "$1" == -qw ]]; then printf '%s\n' "$2" >> "$rel_log"; return 0; fi
+  if [[ "$1" == -n ]]; then
+    case "$2" in
+      net.ipv4.tcp_fin_timeout) printf '30\n' ;;
+      net.ipv4.tcp_keepalive_time) printf '600\n' ;;
+    esac
+    return 0
+  fi
+}
+: > "$rel_log"
+release_unmanaged_keys "$LANDING_TUNED_KEYS" >/dev/null 2>&1
+[[ "$(cat "$rel_log")" != *tcp_fin_timeout* ]] \
+  || fail 'a key the user changed after us must not be restored'
+pass 'a sysctl the user changed after us is left alone'
+[[ "$(cat "$rel_log")" == *'net.ipv4.tcp_keepalive_time=7200'* ]] \
+  || fail 'a key still holding our value should be restored'
+pass 'a sysctl still holding our value is restored to the factory snapshot'
+# Without a pristine snapshot nothing may be written at all.
+printf '# PRISTINE=0\nnet.ipv4.tcp_fin_timeout=60\n' > "$SNAPSHOT_FILE"
+: > "$rel_log"
+release_unmanaged_keys "$LANDING_TUNED_KEYS" >/dev/null 2>&1
+assert_eq '' "$(cat "$rel_log")" 'a non-pristine snapshot must not be replayed as defaults'
+SYSCTL_FILE="$_sf"; SNAPSHOT_FILE="$_snap"
+rm -rf "$rel_dir"
+
+# 3. A config written by an older build carries INITCWND=32. An in-place
+#    upgrade must land on the landing invariant rather than keep re-applying
+#    an initial window to the default route forever.
+mig_dir="$(mktemp -d)"
+_cf="$CONFIG_FILE"; CONFIG_FILE="$mig_dir/conf"
+printf 'ROLE=landing\nLIMIT_MODE=total\nRATE_MBPS=900\nINITCWND=32\n' > "$CONFIG_FILE"
+load_config
+assert_eq 0 "$INITCWND" 'an upgraded landing config is forced to initcwnd 0'
+assert_eq 900 "$RATE_MBPS" 'an upgraded landing config keeps its explicit cap'
+assert_eq total "$LIMIT_MODE" 'an upgraded landing config keeps its limit mode'
+# Migration A: unlimited must stay unlimited, never guessed into a preset.
+printf 'ROLE=landing\nLIMIT_MODE=adaptive\nRATE_MBPS=1000\nTOTAL_MBPS=0\n' > "$CONFIG_FILE"
+load_config
+assert_eq adaptive "$LIMIT_MODE" 'an unlimited landing config stays unlimited on upgrade'
+assert_eq 1000 "$RATE_MBPS" 'an unlimited landing config is not rewritten to a preset'
+# Migration C: relay is untouched by the landing invariant.
+printf 'ROLE=relay\nINITCWND=32\nRATE_MBPS=430\n' > "$CONFIG_FILE"
+load_config
+assert_eq 32 "$INITCWND" 'relay keeps its initcwnd through the same code path'
+assert_eq relay "$ROLE" 'relay role survives'
+CONFIG_FILE="$_cf"
+rm -rf "$mig_dir"
 
 printf '%s\n' 'All self-tests passed.'

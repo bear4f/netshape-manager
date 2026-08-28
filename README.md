@@ -6,7 +6,7 @@
 ## 能做什么
 
 - SSH 中文交互面板；安装即进入面板选择机器角色，安装后直接运行 `netshape`
-- 两种机器角色：中转/观看机（跨境、双层限速）与落地鸡（同区域、不限单连接、缓冲按回源算）
+- 两种机器角色：中转/观看机（跨境、双层限速）与落地鸡（约 1ms、固定缓冲 + HTB aggregate 挡上游 policer）
 - 自动识别 CPU、RAM、Swap、默认出口网卡、MTU、内核和 BBR 支持
 - 双层限速：单条 TCP 连接压在观看设备家宽以下（500M 家宽→430/450，1G 家宽→850/900），整机总出口按 VPS 端口保护（2.5G 口→2300，1G 口→900，可设 0 不限）
 - 多设备在不同家宽环境同时观看时各自跑满自己的带宽，互不挤占；单条流不会打爆"VPS 到家"的跨境路径（这是重传暴涨和断流的根源）
@@ -67,13 +67,13 @@ curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/m
   这台机器是做什么的？
     1) 中转/观看机 —— 客户端在家宽另一端，跨境线路
        逐项询问延迟、VPS 端口、家宽档位，套双层限速
-    2) 落地鸡 —— 与中转机同区域，延迟个位数，无跨境限速器
-       直接套用：不限单连接、按出口节点放大连接表、缓冲按回源计算
+    2) 落地鸡 —— 与中转机同区域，RTT 约 1ms，出口前面通常有商家 policer
+       直接套用：BBR + 固定 32MiB 缓冲 + HTB aggregate + fq leaf
     3) 只做基础 TCP 调优（BBR + fq，完全不限速）
     0) 退出
 ```
 
-选 1 进入原来的逐项向导；选 2 只问一个「端口多大」就配置完；选 3 只做 BBR + fq 不限速。
+选 1 进入原来的逐项向导；选 2 只问一个「端口多大」（自动换算成 HTB cap）；选 3 只做 BBR + fq 不限速。
 
 安装完成后直接运行 SSH 面板：
 
@@ -89,10 +89,10 @@ sudo netshape
 curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install --non-interactive --rate 430 --total 2300 --rtt 160
 ```
 
-落地鸡（1G 口，不限总出口就把 `--total` 设 0）：
+落地鸡（1G 口 → HTB cap 980；`--total` 填的是最终 HTB 值，0 = 不限）：
 
 ```bash
-curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install --non-interactive --role landing --total 900
+curl -fsSL --retry 3 https://raw.githubusercontent.com/bear4f/netshape-manager/main/netshape-manager.sh -o /tmp/netshape-manager.sh && sudo bash /tmp/netshape-manager.sh install --non-interactive --role landing --total 980
 ```
 
 ### 本地文件安装
@@ -148,9 +148,10 @@ sudo netshape
 - `b` 切换整形突发模式（小突发 / 大突发）；
 - `l` 切换为落地鸡模式；
 - `p` 暂停/恢复人为限速（暂停后仍保留 fq 公平排队）；
+- `u` 卸载（按快照还原内核参数、恢复原 qdisc、清掉 initcwnd）；
 - `0` 或 `q` 退出。
 
-落地鸡模式下面板会换成对应的菜单（见下文），按 `4` 切回中转模式。
+落地鸡模式下面板会换成一套更简洁的菜单（见下文），按 `3` 切回中转模式。
 
 数字输入处按 `q` 或 Ctrl-D 可以放弃本次修改回到菜单；某一步失败（内核不支持某种队列、Nginx 配置有错等）只会打印原因并返回菜单，不会关掉面板。
 
@@ -173,9 +174,9 @@ sudo netshape apply              # 恢复持久化配置
 sudo netshape burst policer      # 小突发整形（默认）
 sudo netshape burst throughput   # 大突发整形（10ms 令牌）
 sudo netshape initcwnd 32        # 初始拥塞窗口（0 = 不修改默认路由）
-sudo netshape landing 0          # 切换为落地鸡模式（参数 = 整机总出口，0 = 不限）
+sudo netshape landing 980        # 切换为落地鸡模式（参数 = HTB aggregate 上限，0 = 不限）
 sudo netshape relay              # 切回中转/观看模式
-sudo netshape origin-rtt 150     # 落地鸡回源延迟参考
+sudo netshape uninstall          # 卸载并按快照还原内核参数
 ```
 
 裸数字（`netshape 430`）设置的是**单条连接上限**；整机总出口只能通过 `netshape total`。
@@ -184,43 +185,88 @@ sudo netshape origin-rtt 150     # 落地鸡回源延迟参考
 
 ## 落地鸡模式
 
-落地鸡（出口节点）和中转机的约束几乎是相反的，所以它是一个独立角色，面板会换成对应的菜单：
+落地鸡（出口节点）和中转机的约束几乎相反，所以它是一个**完全独立**的分支：独立的 sysctl 集合、独立的缓冲计算、独立的整形路径，两边不共用任何一条公式。
 
 |  | 中转/观看机 | 落地鸡 |
 |---|---|---|
-| 客户端在哪 | 家宽另一端，跨境 | 就是隔壁的中转机 |
-| 到对端延迟 | 100-250ms | 个位数 ms |
-| 路径上有限速器 | 基本都有 | 基本没有 |
-| 单连接上限 | 压在家宽以下（430/850…） | **不限**（没有家宽要保护） |
-| 整机总出口 | 按 VPS 端口 | 可选，仅防打满端口 |
-| HTB 突发 | 小突发（躲限速器） | 大突发（没有限速器要躲） |
-| 接收缓冲按谁算 | 到客户端的 RTT | **回源 RTT，不是到中转机的个位数** |
+| 客户端在哪 | 家宽另一端，跨境 | 隔壁的中转机 |
+| 到对端延迟 | 100-250ms | **约 1ms** |
+| 瓶颈在哪 | 跨境路径上的 policer | **商家自己的上游 egress policer** |
+| TCP 缓冲 | 按 2×BDP 推导（8-128 MiB） | **固定 32 MiB**，不看 RTT/BDP |
+| 单连接上限 | 压在家宽以下 | 不设 |
+| 出口控制 | HTB 总出口 + fq maxrate | **HTB aggregate + fq leaf** |
+| HTB 突发 | 可切换 | 固定小突发（约 1ms 令牌） |
+| initcwnd | 32 | **关闭** |
+| 端口档位 | 500M→430/450 | **500M→490、1G→980、2G→1960、2.5G→2450** |
 
-最后一行是这个模式存在的主要理由。落地鸡有两条腿：
+### 这些数字是实测来的，不是经验推的
+
+一台真实落地鸡，到三台中转机 RTT 都稳定在 1ms：
+
+| | 不整形 | HTB 950M + fq leaf |
+|---|---|---|
+| 稳定吞吐 | 撞在约 **1.0 Gbps** | **902-908 Mbps** |
+| 15 秒重传 | **138000-149000** | **几十** |
+
+同时在落地鸡本机测到：`fq dropped`、`TCPBacklogDrop`、`TCPRcvQDrop`、`softnet_dropped`、`time_squeeze` 增量**全部为 0**，网卡 RX drop 在压测期间只增加个位数。
+
+也就是说：**不是 rmem/wmem 不够，不是 softirq，不是 netdev backlog，不是本机队列。** 是约 1Gbps 的宿主机/上游 policer。
+
+所以落地鸡的方向是**保守 buffer + aggregate shaping**，不是继续扩 buffer。1ms 下 1Gbps 的 BDP 只有约 125KB、2Gbps 约 250KB —— 32 MiB 已经是上百倍余量，再往上只是给 BBR 更多超发空间。
+
+### 落地鸡只写这些 sysctl
 
 ```
-远端源站  ──(任意 RTT，几十到两百多 ms，大流量从这边进来)──>  落地鸡
-落地鸡    ──(个位数 ms，自己的干净内网/同区域链路)────────>  中转机
+net.ipv4.tcp_congestion_control = bbr      net.core.default_qdisc = fq
+net.core.rmem_max = 33554432               net.core.wmem_max = 33554432
+net.ipv4.tcp_rmem = 4096 87380 33554432    net.ipv4.tcp_wmem = 4096 16384 33554432
+net.ipv4.tcp_moderate_rcvbuf = 1           net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_slow_start_after_idle = 0     net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_fastopen = 3                  net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_ecn = 0                       net.core.netdev_max_backlog = 16384
+net.ipv4.udp_rmem_min = 8192               net.ipv4.udp_wmem_min = 8192
 ```
 
-如果照搬「用到对端的延迟算缓冲」，1 Gbps 的落地鸡按 5ms 只能得到 8 MiB 接收缓冲（下限兜底），**从远端源站拉数据会被这个值卡死**；按回源 150ms 算则是 36 MiB。发送缓冲仍按到中转机的个位数延迟计算，落在 8 MiB 下限上——那条腿本来也不需要更多。
+内存不足 1 GiB 时缓冲上限降到 16 MiB。
 
-回源参考值默认 150ms，可以按你实际拉取的源站调整：
+**刻意不碰的**：`tcp_mem`、`tcp_adv_win_scale`、`tcp_notsent_lowat`、`tcp_tw_reuse`、`tcp_fin_timeout`、`tcp_keepalive_*`、`tcp_max_tw_buckets`、`ip_local_port_range`、`somaxconn`、`tcp_max_syn_backlog`、`nf_conntrack_max`、`vm.min_free_kbytes`。这些是系统策略，不是网速旋钮，1ms 路径上动它们买不到任何吞吐。
 
-```bash
-sudo netshape origin-rtt 250     # 源站更远
+从旧版本升级时，如果这些参数曾被 NetShape 改过：有出厂快照就**按快照逐项还原**；没有可信快照则**明确告知需要重启**，绝不猜内核默认值。
+
+### 为什么必须是 HTB 而不是 fq maxrate
+
+`fq maxrate` 是**每条流**的上限。四条流各限 980，端口上仍然是 4 Gbps —— 上游 policer 照样被打穿。只有 HTB 能给出**聚合**上限，所以它是落地鸡的主路径：
+
+```
+HTB aggregate（rate = ceil = cap，burst = cburst = 约1ms令牌）
+  └─ fq leaf（limit 10000 / flow_limit 256）
+       └─ eth0
 ```
 
-同时按出口节点的特点放大了连接相关的限制——出口节点的瓶颈通常是表和端口，不是带宽：
+回退顺序：HTB + fq → TBF + fq → 裸 fq（并强告警，因为此时已经没有聚合上限了）。**不走 CAKE** —— 落地鸡的基准路径必须是实机验证过的那一条。
 
-- `ip_local_port_range` 放宽到 `10240 65535`
-- `tcp_max_tw_buckets`、`fs.file-max` 按内存分档抬高
-- `net.netfilter.nf_conntrack_max` 在 conntrack 已加载时一并抬高（表满会静默丢新连接，症状和上游故障一模一样）
-- `somaxconn` / `tcp_max_syn_backlog` 提到 8192
+叶子队列固定 10000 / 256，不用中转机那套按内存放大到 40960 / 8192 的深度：1ms 路径上那么深的队列只是徒增排队延迟。
 
-不变的是：TCP Fast Open 和 ECN 仍然关着。落地鸡要连的是任意源站，不是可控的内网对端，这两项在陌生中间设备上出问题的代价远大于省下的那一个 RTT。
+### 端口档位
 
-两个角色随时可以互切，面板里中转模式按 `l`、落地模式按 `4`，或者用 `netshape landing` / `netshape relay`。
+填的是**物理/套餐端口**，面板显示推导出的 HTB cap：
+
+| 端口 | HTB cap |
+|---|---|
+| 500 Mbps | 490 |
+| 1 Gbps | **980** |
+| 2 Gbps | 1960 |
+| 2.5 Gbps | 2450 |
+
+约 98% 线速。自定义时填的就是最终 HTB 值，不再偷偷乘系数。
+
+> **HTB 数值不等于 iperf3 的 TCP payload。** 1G 口设 980 时实际有效吞吐通常在 900 上下，这是正常的 —— 目标是把重传从每 15 秒十几万压到几十，而不是让测速数字刚好凑到 1000。
+
+### 落地鸡的诊断
+
+`netshape status` 在落地鸡模式下换成专用页面：HTB cap、burst、fq leaf 深度、initcwnd 状态、以及**实际 root qdisc**（与配置不符时直接告警）。
+
+实时重传率 >1% 时给的建议是「优先怀疑上游 policer，把 HTB cap 降一档」，**不会**建议加大 rmem/wmem/tcp_mem/队列深度。同时会打印本机协议栈的丢包计数——如果 `TCPBacklogDrop`、`TCPRcvQDrop`、`softnet_dropped` 全是 0 而重传很高，会明确指出「本机协议栈未见丢包，重传更可能发生在 eth0 之后」。
 
 ### 整形突发模式
 

@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="5.3.0"
+VERSION="5.4.0"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -228,6 +228,58 @@ calculate_htb_burst_kb() {
 # fq leaf queue depth. The kernel default of 100 packets per flow is far too
 # shallow at 2 Gbit x 160ms; scaled down on small boxes so the queue itself
 # cannot become the memory problem.
+# ── 落地鸡专用计算（与 relay 完全独立，不共用 BDP 逻辑）─────────────────────
+#
+# 实测背景（1ms RTT 的同区域 landing）：
+#   一个 500M 对端 iperf3 reverse 488Mbps / 15s Retr 35，干净。
+#   两个标称 2G 的对端不整形时都稳定撞在约 1.0Gbps，15s Retr 138000-149000。
+#   本机 fq dropped / TCPBacklogDrop / TCPRcvQDrop / softnet_dropped /
+#   time_squeeze 增量全为 0，网卡 RX drop 只有个位数。
+# 结论：不是 buffer 不够、不是 softirq、不是本机队列，是约 1Gbps 的上游
+# policer。HTB 950M + fq leaf 之后 Retr 从每 15 秒十几万降到几十。
+#
+# 所以 landing 的方向是「保守 buffer + aggregate shaping」，不是继续扩 buffer。
+
+# 固定值，不按 BDP 推导。1ms RTT 下 1Gbps 的 BDP 只有约 125KB，2Gbps 约
+# 250KB —— 32MiB 已经是几十倍余量，再大只会给 BBR 超发留空间。
+landing_buffer_cap() {
+  local mem="${1:-1024}"
+  if (( mem < 1024 )); then
+    printf '%s\n' $((16 * 1024 * 1024))
+  else
+    printf '%s\n' $((32 * 1024 * 1024))
+  fi
+}
+
+# 端口档位 → HTB aggregate cap。约 98% 线速：留出的余量只要够躲开 policer
+# 的判定即可，旧版 1G→900 那种档位白白丢掉了 8% 的带宽。
+landing_recommended_cap() {
+  local port="${1:-1000}"
+  is_uint "$port" && (( port > 0 )) || { printf '0\n'; return 1; }
+  case "$port" in
+    500) printf '490\n' ;;
+    1000) printf '980\n' ;;
+    2000) printf '1960\n' ;;
+    2500) printf '2450\n' ;;
+    *) printf '%s\n' $(( port * 98 / 100 )) ;;
+  esac
+}
+
+# 约 1ms 的令牌，向上对齐到 16KiB。policer 判的是瞬时速率，10ms 的大桶正是
+# 打穿它的原因 —— landing 直连商家出口，比 relay 更需要小突发。
+landing_burst_kb() {
+  local rate="${1:-1000}" kb
+  kb=$(( (rate * 125 + 1023) / 1024 ))
+  kb=$(( (kb + 15) / 16 * 16 ))
+  (( kb < 32 )) && kb=32
+  (( kb > 256 )) && kb=256
+  printf '%s\n' "$kb"
+}
+
+# 固定的浅叶子队列。relay 的 fq_leaf_limits() 按内存放大到 40960/8192，那是
+# 为高 BDP 跨境路径准备的；1ms 路径上那么深的队列只是徒增排队延迟。
+landing_fq_leaf_limits() { printf '10000 256\n'; }
+
 fq_leaf_limits() {
   local mem="$1"
   if (( mem < 1024 )); then
@@ -300,20 +352,6 @@ role_short() {
     landing) printf '落地鸡\n' ;;
     *) printf '未知\n' ;;
   esac
-}
-
-# A landing box has two very different legs and they must not share one RTT:
-#   origin -> landing   arbitrary internet RTT, this is where the bulk arrives
-#   landing -> relay    single-digit ms on a clean link the user owns
-# Sizing receive buffers off the relay's 5ms would cap every download from a
-# distant origin, which is the opposite of what the machine is for. Send
-# buffers keep the relay RTT and simply land on calculate_tcp_max's 8 MiB floor.
-recv_buffer_rtt() {
-  local role="${1:-relay}" rtt="${2:-160}" origin_rtt="${3:-150}"
-  if [[ "$role" == landing ]]; then
-    (( origin_rtt > rtt )) && { printf '%s\n' "$origin_rtt"; return; }
-  fi
-  printf '%s\n' "$rtt"
 }
 
 burst_mode_label() {
@@ -497,6 +535,10 @@ load_config() {
       ORIGIN_RTT_MS) is_uint "$value" && (( value >= 1 && value <= 3000 )) && ORIGIN_RTT_MS="$value" ;;
     esac
   done < "$CONFIG_FILE"
+  # Landing invariant, enforced on load rather than only at set_landing time:
+  # a config written by an older build carries INITCWND=32, and an in-place
+  # upgrade would otherwise keep re-applying it to the default route forever.
+  [[ "$ROLE" == landing ]] && INITCWND=0
   # A rejected value on the final line would otherwise make load_config exit
   # non-zero and take the whole script down with it under errexit.
   return 0
@@ -643,6 +685,120 @@ restore_snapshot() {
   fi
 }
 
+# Exactly what landing writes — nothing else. Every key relay sets beyond this
+# list is deliberately left alone: at 1ms RTT none of them buys throughput, and
+# several (tcp_mem, notsent_lowat, keepalive, fin_timeout, conntrack, port
+# range) are system-policy knobs a speed tool has no business owning.
+LANDING_TUNED_KEYS='
+net.core.default_qdisc
+net.ipv4.tcp_congestion_control
+net.core.rmem_max
+net.core.wmem_max
+net.ipv4.tcp_rmem
+net.ipv4.tcp_wmem
+net.ipv4.tcp_moderate_rcvbuf
+net.ipv4.tcp_window_scaling
+net.ipv4.tcp_slow_start_after_idle
+net.ipv4.tcp_no_metrics_save
+net.ipv4.tcp_fastopen
+net.ipv4.tcp_mtu_probing
+net.ipv4.tcp_ecn
+net.core.netdev_max_backlog
+net.ipv4.udp_rmem_min
+net.ipv4.udp_wmem_min
+'
+
+# Keys a previous profile wrote that the incoming one no longer manages.
+# Deleting the drop-in does not undo them — they stay live until reboot — so
+# restore them from the factory snapshot when we have a trustworthy one, and
+# say so plainly when we do not rather than guessing kernel defaults.
+release_unmanaged_keys() {
+  local keep=" ${1:-} " key value released=0
+  local stale=()
+  [[ -r "$SYSCTL_FILE" ]] || return 0
+  while read -r key; do
+    [[ -n "$key" ]] || continue
+    [[ "$keep" == *" $key "* ]] && continue
+    stale+=("$key")
+  done < <(awk '/^[a-z]/ {print $1}' "$SYSCTL_FILE" 2>/dev/null || true)
+  (( ${#stale[@]} > 0 )) || return 0
+  if snapshot_is_pristine; then
+    local ours live skipped=0
+    for key in "${stale[@]}"; do
+      value="$(awk -v k="$key" 'index($0, k "=") == 1 {sub(/^[^=]*=/, ""); print; exit}' "$SNAPSHOT_FILE")"
+      [[ -n "$value" ]] || continue
+      # Only take a key back if it still holds what we put there. If the live
+      # value has moved, somebody else owns it now — another tool, another
+      # drop-in, or a hand edit — and restoring the factory value would quietly
+      # undo their change. Leaving it alone is always the safer error.
+      ours="$(awk -v k="$key" '$1 == k {sub(/^[^=]*=[[:space:]]*/, ""); print; exit}' "$SYSCTL_FILE")"
+      live="$(sysctl -n "$key" 2>/dev/null || printf '')"
+      if [[ -n "$ours" && -n "$live" ]] \
+        && [[ "$(printf '%s' "$live" | tr -s '[:space:]' ' ')" != "$(printf '%s' "$ours" | tr -s '[:space:]' ' ')" ]]; then
+        skipped=$((skipped + 1))
+        warn "${key} 的当前值与 NetShape 写入的不同，判定为他人接管，已跳过不还原"
+        continue
+      fi
+      sysctl -qw "$key=$value" >/dev/null 2>&1 && released=$((released + 1))
+    done
+    log "已按出厂快照还原 ${released} 项本模式不再管理的内核参数"
+    (( skipped > 0 )) && info "另有 ${skipped} 项已被其他配置接管，保持原样。"
+  else
+    warn "以下参数本模式不再管理，但没有可信的出厂快照，无法还原运行时值："
+    printf '    %s\n' "${stale[@]}" >&2
+    warn "持久化配置会被移除，这些值需要重启后才回到内核默认。"
+  fi
+  return 0
+}
+
+# Landing's own sysctl profile. Deliberately short, and deliberately not a
+# function of RTT or BDP: at 1ms the BDP of a 2Gbps link is about 250KB, so a
+# fixed 32MiB ceiling already carries a two-orders-of-magnitude margin. Growing
+# it further only gives BBR more room to overshoot into the upstream policer.
+write_landing_sysctl_profile() {
+  local mem cap cc temp
+  mem="$(mem_total_mb)"; (( mem > 0 )) || mem=1024
+  cap="$(landing_buffer_cap "$mem")"
+  has modprobe && modprobe sch_fq >/dev/null 2>&1 || true
+  cc="$(choose_congestion_control)"
+
+  release_unmanaged_keys "$LANDING_TUNED_KEYS"
+
+  mkdir -p "$(dirname "$SYSCTL_FILE")" "$STATE_DIR"
+  temp="$(mktemp "${SYSCTL_FILE}.XXXXXX")"
+  # shellcheck disable=SC2064
+  trap "rm -f '$temp'" RETURN
+  {
+    printf '# Generated by NetShape Manager %s (landing) - do not hand edit.\n' "$VERSION"
+    printf '# Fixed buffers by design: RAM=%sMB cap=%s bytes. Not derived from RTT.\n\n' "$mem" "$cap"
+  } > "$temp"
+
+  append_sysctl "$temp" net.core.default_qdisc fq
+  append_sysctl "$temp" net.ipv4.tcp_congestion_control "$cc"
+  append_sysctl "$temp" net.core.rmem_max "$cap"
+  append_sysctl "$temp" net.core.wmem_max "$cap"
+  append_sysctl "$temp" net.ipv4.tcp_rmem "4096 87380 $cap"
+  append_sysctl "$temp" net.ipv4.tcp_wmem "4096 16384 $cap"
+  append_sysctl "$temp" net.ipv4.tcp_moderate_rcvbuf 1
+  append_sysctl "$temp" net.ipv4.tcp_window_scaling 1
+  append_sysctl "$temp" net.ipv4.tcp_slow_start_after_idle 0
+  append_sysctl "$temp" net.ipv4.tcp_no_metrics_save 1
+  append_sysctl "$temp" net.ipv4.tcp_fastopen 3
+  append_sysctl "$temp" net.ipv4.tcp_mtu_probing 1
+  append_sysctl "$temp" net.ipv4.tcp_ecn 0
+  append_sysctl "$temp" net.core.netdev_max_backlog 16384
+  append_sysctl "$temp" net.ipv4.udp_rmem_min 8192
+  append_sysctl "$temp" net.ipv4.udp_wmem_min 8192
+
+  chmod 0644 "$temp"
+  mv -f "$temp" "$SYSCTL_FILE"
+  trap - RETURN
+  if has sysctl; then
+    sysctl -p "$SYSCTL_FILE" >/dev/null || die "sysctl 加载失败；配置文件保留在 $SYSCTL_FILE 供检查"
+  fi
+  log "TCP 配置已更新（落地鸡）：${cc} + fq，收发缓冲上限均为 $(format_bytes "$cap")（固定值，不按 BDP 推导）"
+}
+
 choose_congestion_control() {
   local available=''
   has modprobe && modprobe tcp_bbr >/dev/null 2>&1 || true
@@ -662,30 +818,27 @@ write_sysctl_profile() {
   take_lock
   load_config
   take_snapshot
-  local mem rmax wmax backlog notsent cc temp min_free tcpmem rrtt
+  # Landing has its own profile with its own key set; the two never share a
+  # calculation. Everything below this line is the relay path, unchanged.
+  if [[ "$ROLE" == landing ]]; then
+    write_landing_sysctl_profile
+    return 0
+  fi
+  local mem rmax wmax backlog notsent cc temp min_free tcpmem
   local somaxconn syn_backlog tw_buckets file_max port_range conntrack
   mem="$(mem_total_mb)"
   (( mem > 0 )) || mem=1024
-  rrtt="$(recv_buffer_rtt "$ROLE" "$RTT_MS" "$ORIGIN_RTT_MS")"
-  rmax="$(calculate_tcp_max "$RATE_MBPS" "$rrtt" "$mem")"
-  wmax="$(calculate_tcp_max "$RATE_MBPS" "$RTT_MS" "$mem")"
+  rmax="$(calculate_tcp_max "$RATE_MBPS" "$RTT_MS" "$mem")"
+  wmax="$rmax"
   if (( mem < 1024 )); then backlog=4096; else backlog=16384; fi
   if (( mem < 1024 )); then min_free=32768; else min_free=65536; fi
-  if (( rrtt >= 120 )); then notsent=16384; else notsent=32768; fi
+  if (( RTT_MS >= 120 )); then notsent=16384; else notsent=32768; fi
   tcpmem="$(tcp_mem_values "$mem")"
-  # A landing box is an exit: thousands of short-lived outbound connections,
-  # so the limits that bite are table sizes and ephemeral ports, not bandwidth.
-  if [[ "$ROLE" == landing ]]; then
-    somaxconn=8192; syn_backlog=8192; port_range='10240 65535'
-    if (( mem < 1024 )); then
-      tw_buckets=65536; file_max=262144; conntrack=131072
-    else
-      tw_buckets=262144; file_max=1048576; conntrack=524288
-    fi
-  else
-    somaxconn=2048; syn_backlog=2048; port_range='32768 60999'
-    tw_buckets=32768; file_max=262144; conntrack=65536
-  fi
+  somaxconn=2048; syn_backlog=2048; port_range='32768 60999'
+  tw_buckets=32768; file_max=262144; conntrack=65536
+  # A relay profile owns keys landing does not; switching back has to put the
+  # full set in place again rather than inherit landing's short list.
+  release_unmanaged_keys "$TUNED_KEYS"
   has modprobe && modprobe sch_fq >/dev/null 2>&1 || true
   cc="$(choose_congestion_control)"
 
@@ -693,8 +846,8 @@ write_sysctl_profile() {
   temp="$(mktemp "${SYSCTL_FILE}.XXXXXX")"
   {
     printf '# Generated by NetShape Manager %s - do not hand edit.\n' "$VERSION"
-    printf '# Inputs: role=%s line=%sMbps rate=%sMbps RTT=%sms recv-RTT=%sms RAM=%sMB\n\n' \
-      "$ROLE" "$LINE_MBPS" "$RATE_MBPS" "$RTT_MS" "$rrtt" "$mem"
+    printf '# Inputs: role=%s line=%sMbps rate=%sMbps RTT=%sms RAM=%sMB\n\n' \
+      "$ROLE" "$LINE_MBPS" "$RATE_MBPS" "$RTT_MS" "$mem"
   } > "$temp"
 
   append_sysctl "$temp" vm.swappiness 10
@@ -752,12 +905,8 @@ write_sysctl_profile() {
   if has sysctl; then
     sysctl -p "$SYSCTL_FILE" >/dev/null || die "sysctl 加载失败；配置文件保留在 $SYSCTL_FILE 供检查"
   fi
-  if [[ "$ROLE" == landing ]]; then
-    log "TCP 配置已更新（落地鸡）：${cc}，接收缓冲 $(format_bytes "$rmax")（按回源 ${rrtt}ms 计算），发送缓冲 $(format_bytes "$wmax")"
-  else
-    log "TCP 配置已更新：${cc}，缓冲上限 $(format_bytes "$rmax")（$(buffer_cap_reason "$RATE_MBPS" "$rrtt" "$mem")），notsent ${notsent}B"
-  fi
-  if (( rmax < RATE_MBPS * rrtt * 125 )); then
+  log "TCP 配置已更新：${cc}，缓冲上限 $(format_bytes "$rmax")（$(buffer_cap_reason "$RATE_MBPS" "$RTT_MS" "$mem")），notsent ${notsent}B"
+  if (( rmax < RATE_MBPS * RTT_MS * 125 )); then
     warn "内存较小，TCP 缓冲上限低于单流 BDP；高 RTT 下单连接可能无法跑满线路"
   fi
   if (( mem <= 1024 )) && (( $(swap_total_mb) == 0 )); then
@@ -929,6 +1078,141 @@ try_fq_maxrate() {
   tc qdisc add dev "$iface" root fq maxrate "${rate}mbit" 2>> "$error_file" || return 1
 }
 
+# ── 落地鸡整形（HTB aggregate + fq leaf）─────────────────────────────────────
+#
+# fq maxrate is a PER-FLOW ceiling. Four flows capped at 980 each still put
+# 4 Gbps on the wire, which is precisely how the ~1Gbps upstream policer got
+# hit in testing. Only HTB bounds the aggregate, so it is the primary path and
+# the fallbacks are ordered by how close they come to that property.
+add_landing_fq_leaf() {
+  local iface="$1" parent="$2" handle="$3" error_file="$4" limits limit flow
+  limits="$(landing_fq_leaf_limits)"
+  limit="${limits%% *}"; flow="${limits##* }"
+  # tc takes bare integers here; the trailing "p" only appears in tc's output.
+  tc qdisc add dev "$iface" parent "$parent" handle "$handle" \
+     fq limit "$limit" flow_limit "$flow" 2>> "$error_file" && return 0
+  # An fq too old for limit/flow_limit must not be mistaken for "HTB missing".
+  tc qdisc add dev "$iface" parent "$parent" handle "$handle" fq 2>> "$error_file"
+}
+
+try_landing_htb() {
+  local iface="$1" rate="$2" burst_kb="$3" error_file="$4"
+  tc qdisc del dev "$iface" root 2>/dev/null || true
+  tc qdisc add dev "$iface" root handle 1: htb default 10 r2q 1000 2> "$error_file" || {
+    tc qdisc del dev "$iface" root 2>/dev/null || true; return 1; }
+  tc class add dev "$iface" parent 1: classid 1:10 htb \
+     rate "${rate}mbit" ceil "${rate}mbit" \
+     burst "${burst_kb}kb" cburst "${burst_kb}kb" quantum 15140 2>> "$error_file" || {
+    tc qdisc del dev "$iface" root 2>/dev/null || true; return 1; }
+  add_landing_fq_leaf "$iface" 1:10 10: "$error_file" || {
+    tc qdisc del dev "$iface" root 2>/dev/null || true; return 1; }
+}
+
+try_landing_tbf() {
+  local iface="$1" rate="$2" burst_kb="$3" error_file="$4"
+  tc qdisc del dev "$iface" root 2>/dev/null || true
+  tc qdisc add dev "$iface" root handle 1: tbf rate "${rate}mbit" \
+     burst "${burst_kb}kb" latency 50ms 2> "$error_file" || {
+    tc qdisc del dev "$iface" root 2>/dev/null || true; return 1; }
+  add_landing_fq_leaf "$iface" 1:1 10: "$error_file" || {
+    tc qdisc del dev "$iface" root 2>/dev/null || true; return 1; }
+}
+
+apply_landing_shape() {
+  local iface="$1" error_file selected='' detail burst_kb rate
+
+  if [[ "$SHAPING" == off ]]; then
+    restore_default_qdisc "$iface"
+    log "已取消人为限速，并恢复连接公平排队：$iface"
+    return 0
+  fi
+
+  if [[ "$LIMIT_MODE" == adaptive ]]; then
+    restore_default_qdisc "$iface"
+    SHAPER_MODE=fq
+    save_config
+    warn "未设置 aggregate shaper。如果 VPS 上游有 policer，接近线速时会产生大量 TCP 重传。"
+    info "实测参考：不整形时撞在约 1Gbps，15 秒重传 14 万次；HTB 950M 后降到几十次。"
+    return 0
+  fi
+
+  rate="$RATE_MBPS"
+  (( rate >= 10 && rate <= 100000 )) || die "无效出口上限：${rate}Mbps"
+  burst_kb="$(landing_burst_kb "$rate")"
+  error_file="$(mktemp)"
+  # shellcheck disable=SC2064
+  trap "rm -f '$error_file'" RETURN
+
+  info "正在设置落地鸡出口：HTB aggregate ≤ ${rate} Mbps，burst ${burst_kb} KiB（网卡 ${iface}）"
+  if [[ "$SHAPER_MODE" != tbf && "$SHAPER_MODE" != fq ]] \
+    && try_landing_htb "$iface" "$rate" "$burst_kb" "$error_file"; then
+    selected=htb
+  elif [[ "$SHAPER_MODE" != fq ]] \
+    && try_landing_tbf "$iface" "$rate" "$burst_kb" "$error_file"; then
+    selected=tbf
+    warn "本机内核不支持 HTB，已退到 TBF + fq（同样是 aggregate 限速，精度略差）"
+  elif tc qdisc replace dev "$iface" root fq 2>> "$error_file"; then
+    selected=fq
+    warn "本机既不支持 HTB 也不支持 TBF，只剩 fq —— 没有 aggregate 上限！"
+    warn "上游若有 policer，接近线速时仍会大量重传，这台机器不适合做落地。"
+  else
+    detail="$(tail -n 1 "$error_file" 2>/dev/null || true)"
+    restore_default_qdisc "$iface"
+    die "无法设置任何队列，已恢复默认。${detail:+ 内核返回：$detail}"
+  fi
+
+  SHAPER_MODE="$selected"
+  save_config
+  case "$selected" in
+    htb)
+      verify_shaper "$iface" htb "$rate" || true
+      log "已启用 HTB aggregate ≤ ${rate} Mbps + fq leaf（limit $(landing_fq_leaf_limits | cut -d' ' -f1) / flow_limit $(landing_fq_leaf_limits | cut -d' ' -f2)）"
+      info "HTB 数值不等于 iperf3 TCP payload；实际有效吞吐通常略低，但能显著减少撞上游 policer 后的重传。"
+      ;;
+    tbf) verify_shaper "$iface" tbf "$rate" || true ;;
+  esac
+  return 0
+}
+
+# Landing runs at ~1ms with an upstream policer in front of it: an inflated
+# first window buys nothing and only makes the initial burst likelier to be
+# policed. Switching over has to strip an initcwnd relay may have installed —
+# clearing the config variable alone would leave the route metric in place.
+# A multipath (ECMP) default route prints as a header line plus indented
+# nexthop lines. Taking head -1 of that and feeding it back to `ip route
+# replace` would try to replace a multipath route with one that has no
+# nexthop; the kernel refuses, but the error is confusing and the intent was
+# never to touch such a route. Detect and decline instead.
+default_route_is_multipath() {
+  has ip || return 1
+  (( $(ip route show default 2>/dev/null | grep -c '') > 1 ))
+}
+
+clear_initcwnd() {
+  local spec
+  local IFS=$' \t\n'
+  rm -f "$ROUTE_HOOK"
+  has ip || return 0
+  if default_route_is_multipath; then
+    warn "默认路由是多路径（ECMP），不自动改动；如有 initcwnd 请手动清理"
+    return 0
+  fi
+  spec="$(ip route show default 2>/dev/null | head -n 1)"
+  [[ -n "$spec" ]] || return 0
+  case "$spec" in
+    *initcwnd*|*initrwnd*) ;;
+    *) return 0 ;;
+  esac
+  spec="$(printf '%s\n' "$spec" | sed -E 's/ initcwnd [0-9]+//g; s/ initrwnd [0-9]+//g')"
+  # shellcheck disable=SC2086
+  if ip route replace $spec 2>/dev/null; then
+    info "已从默认路由移除 initcwnd/initrwnd"
+  else
+    warn "未能从默认路由移除 initcwnd/initrwnd，请手动检查：ip route show default"
+  fi
+  return 0
+}
+
 # Larger initial windows shave RTTs off the start of every connection, which
 # on a high-BDP cross-border path is exactly the play/seek feel. Rewritten
 # from the live default route so its other attributes survive.
@@ -937,6 +1221,10 @@ apply_initcwnd() {
   local IFS=$' \t\n'
   (( INITCWND == 0 )) && return 0
   has ip || return 0
+  if default_route_is_multipath; then
+    warn "默认路由是多路径（ECMP），已跳过 initcwnd 设置"
+    return 0
+  fi
   spec="$(ip route show default 2>/dev/null | head -n 1)"
   [[ -n "$spec" ]] || return 0
   [[ "$spec" == *" dev $iface"* || "$spec" == *" dev $iface" ]] || return 0
@@ -983,6 +1271,13 @@ apply_shape() {
     modprobe sch_tbf >/dev/null 2>&1 || true
     modprobe sch_fq >/dev/null 2>&1 || true
   }
+
+  # Landing has its own shaper with its own fallback order (HTB first, CAKE
+  # never). Everything below is the relay path, unchanged.
+  if [[ "$ROLE" == landing ]]; then
+    apply_landing_shape "$iface"
+    return 0
+  fi
 
   if [[ "$SHAPING" == off ]]; then
     restore_default_qdisc "$iface"
@@ -1121,7 +1416,14 @@ apply_shape() {
 apply_all() {
   write_sysctl_profile
   apply_shape
-  apply_initcwnd "$(resolve_iface)"
+  local iface; iface="$(resolve_iface)"
+  # INITCWND is 0 for landing, and clearing has to be active: a route metric
+  # relay installed survives a config change on its own.
+  if (( INITCWND == 0 )); then
+    clear_initcwnd
+  else
+    apply_initcwnd "$iface"
+  fi
 }
 
 set_profile() {
@@ -1228,54 +1530,76 @@ set_off() {
   apply_shape
 }
 
-# Landing box: the per-flow cap exists to keep a single stream from
-# overrunning someone's home broadband across a policed border. Neither
-# condition holds here, so the cap is dropped and the aggregate one becomes
-# purely optional port protection.
+# A landing box sits one hop from its relay behind the provider's own egress
+# limiter. The argument is the final aggregate cap in Mbps (0 = none), not a
+# port size — presets are converted before they get here so the number shown
+# in the UI is the number that reaches tc.
 set_landing() {
-  local total="${1:-}"
+  local cap="${1:-}" was_landing=0
   need_root "$@"
   take_lock
   load_config
-  is_uint "$total" || total=0
+  [[ "$ROLE" == landing ]] && was_landing=1
+  is_uint "$cap" || cap=0
+  (( cap == 0 || (cap >= 10 && cap <= 100000) )) || die "出口上限范围为 0 或 10-100000 Mbps"
+
   ROLE="landing"
   PROFILE="custom"
   SHAPING="on"
-  RATE_MBPS=0
-  TOTAL_MBPS="$total"
-  # No policer between two boxes in the same region, so a large token bucket
-  # is free throughput rather than a way to get punched through.
-  BURST_MODE="throughput"
-  if (( total > 0 )); then
+  BURST_MODE="policer"
+  INITCWND=0
+  # Measured at 1ms to all three relays; 160 is a cross-border default that
+  # would misdescribe this machine. An existing landing box keeps what it has.
+  (( was_landing == 0 )) && RTT_MS=1
+  if (( cap > 0 )); then
     LIMIT_MODE="total"
-    RATE_MBPS="$total"
-    SHAPER_MODE="auto"
+    SHAPER_MODE="htb"
+    RATE_MBPS="$cap"
+    TOTAL_MBPS="$cap"    # mirrored for config compatibility only
   else
     LIMIT_MODE="adaptive"
-    RATE_MBPS=1000
     SHAPER_MODE="fq"
+    RATE_MBPS=1000
+    TOTAL_MBPS=0
   fi
   save_config
   apply_all
-  log "已按落地鸡模式配置：不限制单连接，$( (( total > 0 )) && printf '整机总出口 ≤ %s Mbps' "$total" || printf '不限制整机总出口' )"
-  info "接收缓冲按回源 ${ORIGIN_RTT_MS}ms 计算，连接表/端口范围已按出口节点放大。"
+  if (( cap > 0 )); then
+    log "已按落地鸡模式配置：HTB aggregate ≤ ${cap} Mbps，burst $(landing_burst_kb "$cap") KiB，initcwnd 关闭"
+  else
+    log "已按落地鸡模式配置：未设置 aggregate 上限"
+  fi
+  info "TCP 缓冲固定 $(format_bytes "$(landing_buffer_cap "$(mem_total_mb)")")，不随 RTT/BDP 变化。"
 }
 
 set_relay_role() {
+  local was_landing=0
   need_root "$@"
   take_lock
   load_config
+  [[ "$ROLE" == landing ]] && was_landing=1
   ROLE="relay"
   BURST_MODE="policer"
   LIMIT_MODE="combo"
   SHAPER_MODE="auto"
   SHAPING="on"
+  # Landing's RATE_MBPS is an aggregate cap and its RTT is ~1ms; neither means
+  # anything as a relay per-flow cap, so coming back restores relay defaults.
+  if (( was_landing == 1 )); then
+    RATE_MBPS=430
+    RTT_MS=160
+    INITCWND=32
+  fi
   (( RATE_MBPS < 10 )) && RATE_MBPS=430
   save_config
   apply_all
   log "已切回中转/观看模式：单连接 ≤ ${RATE_MBPS} Mbps"
 }
 
+# Deprecated. Landing used to size receive buffers from an assumed origin RTT;
+# it now uses a fixed ceiling, so this value is informational only. Kept so an
+# existing config file still loads, and so the command does not vanish under
+# anyone's scripts.
 set_origin_rtt() {
   local rtt="${1:-}"
   is_uint "$rtt" || die "回源延迟参考必须是整数毫秒，例如 150"
@@ -1285,7 +1609,8 @@ set_origin_rtt() {
   load_config
   ORIGIN_RTT_MS="$rtt"
   save_config
-  write_sysctl_profile
+  warn "origin-rtt 已废弃：落地鸡的 TCP 缓冲现在是固定值，不再由回源 RTT 推导。"
+  info "此值仅保留作记录，不会影响任何内核参数。"
 }
 
 set_burst() {
@@ -1311,13 +1636,7 @@ set_initcwnd() {
   INITCWND="$value"
   save_config
   if (( value == 0 )); then
-    rm -f "$ROUTE_HOOK"
-    local spec IFS=$' \t\n'
-    spec="$(ip route show default 2>/dev/null | head -n 1)"
-    if [[ "$spec" == *initcwnd* ]] && has ip; then
-      # shellcheck disable=SC2086
-      ip route replace $(printf '%s\n' "$spec" | sed -E 's/ initcwnd [0-9]+//g; s/ initrwnd [0-9]+//g') 2>/dev/null || true
-    fi
+    clear_initcwnd
     log "已停用 initcwnd 调整，默认路由恢复内核默认初始窗口"
     return 0
   fi
@@ -1410,13 +1729,128 @@ nginx_audit() {
   info "审计仅报告，不会改动现有站点配置。"
 }
 
+# Landing reports what landing actually configures — fixed buffer, aggregate
+# cap, leaf depth, burst — rather than relay's BDP-derived vocabulary.
+# Shared by both roles so the numbers mean the same thing in either status.
+show_retrans_block() {
+  has nstat || return 0
+  local pct live
+  printf '\n%b▸ TCP 重传%b\n' "$BOLD" "$RESET"
+  pct="$(retrans_rate)"
+  [[ -n "$pct" ]] && printf '  自开机累计  %s%%%b（机器跑得越久越被稀释，仅供参考）%b\n' "$pct" "$DIM" "$RESET"
+  printf '  正在采样 %s 秒…\r' "$RETRANS_SAMPLE_SECS"
+  live="$(retrans_sample "$RETRANS_SAMPLE_SECS")"
+  if [[ -n "$live" ]]; then
+    printf '  实时 %ss     %s%%  —— %s\n' "$RETRANS_SAMPLE_SECS" "$live" "$(retrans_verdict "$live")"
+    printf '  %b参考：<0.1%% 干净｜0.1-1%% 偏高｜>1%% 基本是撞上了限速器%b\n' "$DIM" "$RESET"
+    if [[ "$ROLE" == landing ]] && awk -v v="$live" 'BEGIN {exit !(v > 1)}'; then
+      printf '\n'
+      warn "重传严重。优先考虑上游 policer 或硬瓶颈，不要继续扩大 TCP buffer。"
+      warn "建议把 aggregate HTB cap 往下调一档再测（面板选 1）。"
+    fi
+  else
+    printf '  实时 %ss     采样窗口内流量太少，无法判定（有流量时再测一次）\n' "$RETRANS_SAMPLE_SECS"
+  fi
+  nstat -asz 2>/dev/null | awk '$1 ~ /TcpOutSegs|TcpRetransSegs|TcpExtTCPLostRetransmit|TcpExtTCPFastRetrans/ {printf "  %s %s\n", $1, $2}' || true
+  return 0
+}
+
+# If the local stack is dropping nothing while retransmissions are high, the
+# loss is not on this box. Saying so stops the usual reflex of growing buffers
+# that are already two orders of magnitude larger than the BDP.
+landing_drop_check() {
+  has nstat || return 0
+  local counters backlog rcvq softnet=0
+  counters="$(nstat -asz 2>/dev/null)" || return 0
+  backlog="$(printf '%s\n' "$counters" | awk '$1 == "TcpExtTCPBacklogDrop" {print $2; exit}')"
+  rcvq="$(printf '%s\n' "$counters" | awk '$1 == "TcpExtTCPRcvQDrop" {print $2; exit}')"
+  if [[ -r /proc/net/softnet_stat ]]; then
+    # softnet_stat is hex. strtonum() is a gawk extension and Debian ships
+    # mawk, where it aborts the script and this silently read 0 — which then
+    # claimed "no local drops" no matter what was really happening.
+    softnet="$(awk '
+      function hex(x,   i, c, v, d) {
+        v = 0; x = tolower(x)
+        for (i = 1; i <= length(x); i++) {
+          d = index("0123456789abcdef", substr(x, i, 1)) - 1
+          if (d < 0) return v
+          v = v * 16 + d
+        }
+        return v
+      }
+      {s += hex($2)} END {printf "%d\n", s}' /proc/net/softnet_stat 2>/dev/null || printf '0')"
+  fi
+  is_uint "${backlog:-}" || backlog=0
+  is_uint "${rcvq:-}" || rcvq=0
+  is_uint "${softnet:-}" || softnet=0
+  printf '\n%b▸ 本机协议栈丢包%b\n' "$BOLD" "$RESET"
+  printf '  TCPBacklogDrop %s ｜ TCPRcvQDrop %s ｜ softnet_dropped %s\n' "$backlog" "$rcvq" "$softnet"
+  if (( backlog == 0 && rcvq == 0 && softnet == 0 )); then
+    printf '  %b本机协议栈未见丢包 —— 重传更可能发生在 eth0 之后的宿主机/上游网络%b\n' "$DIM" "$RESET"
+  else
+    printf '  %b本机有丢包计数，先排查 softirq / backlog，再看上游%b\n' "$DIM" "$RESET"
+  fi
+  return 0
+}
+
+show_landing_status() {
+  local iface mem swap cap burst leaf actual
+  iface="$(detect_iface)"; [[ "$IFACE" != auto ]] && iface="$IFACE"
+  mem="$(mem_total_mb)"; swap="$(swap_total_mb)"
+  (( mem > 0 )) || mem=1024
+  cap="$(landing_buffer_cap "$mem")"
+  burst="$(landing_burst_kb "$RATE_MBPS")"
+  leaf="$(landing_fq_leaf_limits)"
+
+  panel_title 'NetShape 状态 · 落地鸡'
+  printf '  系统:        %s\n' "$(uname -srmo 2>/dev/null || uname -a)"
+  printf '  CPU/RAM:     %s vCPU / %s MB RAM / %s MB Swap\n' "$(cpu_count)" "$mem" "$swap"
+  printf '  网卡:        %s\n' "${iface:-未检测到}"
+  printf '  机器角色:    落地鸡\n'
+  printf '  到中转 RTT:  %s ms\n' "$RTT_MS"
+  printf '  TCP:         %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown')"
+  printf '  TCP buffer:  %s%b（固定值，不按 BDP 推导）%b\n' "$(format_bytes "$cap")" "$DIM" "$RESET"
+  if [[ "$SHAPING" == off ]]; then
+    printf '  出口策略:    %b已暂停人为限速%b\n' "$YELLOW" "$RESET"
+  elif [[ "$LIMIT_MODE" == adaptive ]]; then
+    printf '  出口策略:    %b未设置 aggregate shaper%b\n' "$YELLOW" "$RESET"
+    printf '  HTB cap:     无\n'
+  else
+    printf '  出口策略:    HTB aggregate + fq leaf\n'
+    printf '  HTB cap:     %s Mbps\n' "$RATE_MBPS"
+    printf '  burst:       %s KiB%b（小突发 / policer）%b\n' "$burst" "$DIM" "$RESET"
+  fi
+  printf '  fq leaf:     limit %s / flow_limit %s\n' "${leaf%% *}" "${leaf##* }"
+  printf '  initcwnd:    %s\n' "$( (( INITCWND > 0 )) && printf '%s' "$INITCWND" || printf '关闭' )"
+  if [[ -n "$iface" ]] && has tc; then
+    actual="$(root_qdisc_kind "$iface")"
+    printf '  root qdisc:  %s\n' "${actual:-未知}"
+    if [[ "$SHAPING" != off && "$LIMIT_MODE" != adaptive && -n "$actual" \
+          && "$actual" != htb && "$actual" != tbf ]]; then
+      printf '\n'
+      warn "配置期望 HTB aggregate，实际 root qdisc 是 ${actual} —— 限速没有生效"
+      warn "按面板的「重新应用」，或运行：netshape apply"
+    fi
+    printf '\n%b▸ qdisc 队列统计%b\n' "$BOLD" "$RESET"
+    tc -s qdisc show dev "$iface" 2>/dev/null || true
+    printf '\n%b▸ 限速类别统计%b\n' "$BOLD" "$RESET"
+    tc -s class show dev "$iface" 2>/dev/null || true
+  fi
+  show_retrans_block
+  landing_drop_check
+}
+
 show_status() {
   load_config
+  if [[ "$ROLE" == landing ]]; then
+    show_landing_status
+    return 0
+  fi
   local iface mem swap tcp_max cc qdisc
   iface="$(detect_iface)"
   [[ "$IFACE" != auto ]] && iface="$IFACE"
   mem="$(mem_total_mb)"; swap="$(swap_total_mb)"
-  tcp_max="$(calculate_tcp_max "$RATE_MBPS" "$(recv_buffer_rtt "$ROLE" "$RTT_MS" "$ORIGIN_RTT_MS")" "${mem:-1024}")"
+  tcp_max="$(calculate_tcp_max "$RATE_MBPS" "$RTT_MS" "${mem:-1024}")"
   cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf 'unknown')"
   qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf 'unknown')"
 
@@ -1425,11 +1859,7 @@ show_status() {
   printf '  CPU/RAM:   %s vCPU / %s MB RAM / %s MB Swap\n' "$(cpu_count)" "$mem" "$swap"
   printf '  网卡:      %s\n' "${iface:-未检测到}"
   printf '  机器角色:  %s\n' "$(role_label "$ROLE")"
-  if [[ "$ROLE" == landing ]]; then
-    printf '  延迟参考:  到中转机 %s ms / 回源 %s ms（接收缓冲按后者算）\n' "$RTT_MS" "$ORIGIN_RTT_MS"
-  else
-    printf '  延迟参考:  %s ms\n' "$RTT_MS"
-  fi
+  printf '  延迟参考:  %s ms\n' "$RTT_MS"
   printf '  网络策略:  %s\n' "$(limit_mode_label "$LIMIT_MODE")"
   if [[ "$SHAPING" == off ]]; then
     printf '  限速状态:  已暂停人为限速（保留 fq 公平排队）\n'
@@ -1465,21 +1895,7 @@ show_status() {
     printf '\n%b▸ 限速类别统计%b\n' "$BOLD" "$RESET"
     tc -s class show dev "$iface" 2>/dev/null || true
   fi
-  if has nstat; then
-    local pct live
-    printf '\n%b▸ TCP 重传%b\n' "$BOLD" "$RESET"
-    pct="$(retrans_rate)"
-    [[ -n "$pct" ]] && printf '  自开机累计  %s%%%b（机器跑得越久越被稀释，仅供参考）%b\n' "$pct" "$DIM" "$RESET"
-    printf '  正在采样 %s 秒…\r' "$RETRANS_SAMPLE_SECS"
-    live="$(retrans_sample "$RETRANS_SAMPLE_SECS")"
-    if [[ -n "$live" ]]; then
-      printf '  实时 %ss     %s%%  —— %s\n' "$RETRANS_SAMPLE_SECS" "$live" "$(retrans_verdict "$live")"
-      printf '  %b参考：<0.1%% 干净｜0.1-1%% 偏高｜>1%% 基本是撞上了限速器%b\n' "$DIM" "$RESET"
-    else
-      printf '  实时 %ss     采样窗口内流量太少，无法判定（有人在看片时再测一次）\n' "$RETRANS_SAMPLE_SECS"
-    fi
-    nstat -asz 2>/dev/null | awk '$1 ~ /TcpOutSegs|TcpRetransSegs|TcpExtTCPLostRetransmit|TcpExtTCPFastRetrans/ {printf "  %s %s\n", $1, $2}' || true
-  fi
+  show_retrans_block
 }
 
 diagnose() {
@@ -1504,6 +1920,19 @@ diagnose() {
     nginx_audit
   fi
   printf '\n提示：播放器断流还应同时检查源站负载、丢包、MTU、反代日志和客户端缓冲。\n'
+}
+
+confirm_uninstall() {
+  local reply
+  [[ -t 0 ]] || return 1
+  printf '\n  %b卸载会：%b\n' "$BOLD" "$RESET"
+  printf '    · 按出厂快照逐项还原内核参数（只删配置文件是不够的）\n'
+  printf '    · 恢复安装前记录的 root qdisc\n'
+  printf '    · 移除默认路由上的 initcwnd/initrwnd 与 networkd hook\n'
+  printf '    · 删除 sysctl 片段、systemd 服务和自身\n'
+  printf '    %bNginx 片段与备份保留，避免破坏现有反代。%b\n' "$DIM" "$RESET"
+  read -r -p '  确认卸载？[y/N]: ' reply || return 1
+  [[ "$reply" =~ ^[Yy]$ ]]
 }
 
 confirm_adaptive() {
@@ -1534,6 +1963,34 @@ prompt_uint() {
 
 # Shared by the wizard and the panel so both offer the same port presets.
 # Prompts go to stderr because the caller reads stdout in $(...).
+# Landing asks for the physical port and shows the cap it derives, so the two
+# numbers never get confused. Custom input is taken as the final cap with no
+# hidden coefficient applied on top.
+prompt_landing_cap() {
+  local answer cap
+  printf '%s\n' \
+    '' \
+    '  这台落地鸡的物理/套餐端口是多大？' \
+    '    1) 500 Mbps 口    →  HTB cap 490 Mbps' \
+    '    2) 1 Gbps 口      →  HTB cap 980 Mbps' \
+    '    3) 2 Gbps 口      →  HTB cap 1960 Mbps' \
+    '    4) 2.5 Gbps 口    →  HTB cap 2450 Mbps' \
+    '    5) 自定义（直接填最终 HTB 值，不再打折）' \
+    '    6) 不限制（不推荐）' >&2
+  read -r -p '  请选择 [2]（q 返回）: ' answer || { printf '\n' >&2; return 1; }
+  case "${answer:-2}" in
+    1) cap=490 ;;
+    2) cap=980 ;;
+    3) cap=1960 ;;
+    4) cap=2450 ;;
+    5) cap="$(prompt_uint '  HTB aggregate 上限（Mbps）' 980 10 100000)" || return 1 ;;
+    6) cap=0 ;;
+    q|Q) return 1 ;;
+    *) warn "无效选项"; return 1 ;;
+  esac
+  printf '%s\n' "$cap"
+}
+
 prompt_total_mbps() {
   local answer
   printf '%s\n' \
@@ -1581,14 +2038,14 @@ install_menu() {
       1) wizard "$@"; return 0 ;;
       2)
         printf '\n  %b落地鸡模式将套用：%b\n' "$BOLD" "$RESET"
-        printf '    · 不限制单条连接（家宽上限那套在这里没有意义）\n'
-        printf '    · 接收缓冲按回源 %s ms 计算，而不是到中转机的个位数延迟\n' "$ORIGIN_RTT_MS"
-        printf '    · 端口范围、TIME_WAIT 桶、conntrack、文件句柄按出口节点放大\n'
-        printf '    · HTB 大突发（同区域无限速器，不需要压突发）\n\n'
-        if total="$(prompt_total_mbps)"; then
+        printf '    · BBR + fq，TCP 缓冲固定 32 MiB（1ms 路径上 BDP 只有几百 KB）\n'
+        printf '    · HTB aggregate 限住整机出口，避开商家上游的 policer\n'
+        printf '    · fq leaf 做 flow 公平与 pacing（limit 10000 / flow_limit 256）\n'
+        printf '    · 小突发、关闭 initcwnd —— 低 RTT 下放大首窗只会被 policer 打\n'
+        printf '    · 不动 tcp_mem / keepalive / conntrack / 端口范围等系统策略参数\n\n'
+        if total="$(prompt_landing_cap)"; then
           default_config
           ROLE=landing
-          RTT_MS=5
           save_config
           install_files "$@"
           set_landing "$total"
@@ -1775,9 +2232,9 @@ parse_install_args() {
   if [[ "$ROLE" == landing ]]; then
     is_uint "$TOTAL_MBPS" && (( TOTAL_MBPS == 0 || (TOTAL_MBPS >= 10 && TOTAL_MBPS <= 100000) )) \
       || die "无效 --total（0 表示不限制）"
-    # A landing box sits next to its relay; 160ms is a cross-border default
-    # that would badly misreport this machine.
-    (( rtt_given == 0 )) && RTT_MS=5
+    # Measured at ~1ms to every relay; 160 is a cross-border default that would
+    # badly misdescribe this machine.
+    (( rtt_given == 0 )) && RTT_MS=1
     is_uint "$RTT_MS" && (( RTT_MS >= 1 && RTT_MS <= 3000 )) || die "无效 --rtt"
     need_root "$@"
     save_config
@@ -1822,17 +2279,19 @@ uninstall_all() {
   # top: sysctl --system alone leaves every tuned key live until reboot.
   has sysctl && sysctl --system >/dev/null 2>&1 || true
   has sysctl && restore_snapshot
-  if [[ -n "$iface" ]] && has ip; then
-    local spec
-    spec="$(ip route show default 2>/dev/null | head -n 1)"
-    if [[ "$spec" == *initcwnd* ]]; then
-      local IFS=$' \t\n'
-      # shellcheck disable=SC2086
-      ip route replace $(printf '%s\n' "$spec" | sed -E 's/ initcwnd [0-9]+//g; s/ initrwnd [0-9]+//g') 2>/dev/null || true
-    fi
+  clear_initcwnd
+  # restore_baseline_qdisc already cleared the root and put back whatever was
+  # recorded before install. Do not second-guess it by deleting again: the
+  # thing standing there now may be the user's own qdisc, restored on purpose.
+  if [[ -n "$iface" ]] && has tc; then
+    printf '  卸载后 root qdisc：%s\n' "$(root_qdisc_kind "$iface" || printf '内核默认')"
   fi
-  rm -f "$SNAPSHOT_FILE" "$STATE_DIR/baseline-qdisc"
+  rm -f "$SNAPSHOT_FILE" "$STATE_DIR/baseline-qdisc" "$STATE_DIR/disabled-services"
+  rmdir "$STATE_DIR" 2>/dev/null || true
   log "已卸载 NetShape；Nginx 片段和备份保留，避免破坏现有反代"
+  if [[ -e "$SYSCTL_FILE" || -e "$CONFIG_FILE" || -e "$SERVICE_FILE" ]]; then
+    warn "以下文件未能删除，请手动检查：$SYSCTL_FILE $CONFIG_FILE $SERVICE_FILE"
+  fi
 }
 
 panel_iface() {
@@ -1842,47 +2301,49 @@ panel_iface() {
 }
 
 render_landing_menu() {
-  local total_text drift pct snippet
-  if (( TOTAL_MBPS > 0 )); then
-    total_text="整机 ≤ ${TOTAL_MBPS} Mbps"
-  else
-    total_text='不限（纯 fq 公平排队）'
-  fi
-  panel_title 'NetShape 落地鸡模式'
+  local cap_text drift mem cap burst leaf actual
+  mem="$(mem_total_mb)"; (( mem > 0 )) || mem=1024
+  cap="$(landing_buffer_cap "$mem")"
+  burst="$(landing_burst_kb "$RATE_MBPS")"
+  leaf="$(landing_fq_leaf_limits)"
   if [[ "$SHAPING" == off ]]; then
-    printf '  %b当前策略%b  %b已暂停人为限速%b\n' "$DIM" "$RESET" "$YELLOW" "$RESET"
+    cap_text="${YELLOW}已暂停${RESET}"
+  elif [[ "$LIMIT_MODE" == adaptive ]]; then
+    cap_text="${YELLOW}未设上限${RESET}"
   else
-    printf '  %b当前策略%b  %b不限制单连接｜%s%b\n' "$DIM" "$RESET" "$GREEN" "$total_text" "$RESET"
+    cap_text="${GREEN}${RATE_MBPS} Mbps${RESET}"
   fi
-  printf '  %b到中转机%b  %s ms\n' "$DIM" "$RESET" "$RTT_MS"
-  printf '  %b回源参考%b  %s ms%b（决定接收缓冲，别按到中转机的延迟算）%b\n' "$DIM" "$RESET" "$ORIGIN_RTT_MS" "$DIM" "$RESET"
-  printf '  %b队列模式%b  %s\n' "$DIM" "$RESET" "$(queue_label "$SHAPING" "$LIMIT_MODE" "$SHAPER_MODE")"
-  pct="$(retrans_rate)"
-  if [[ -n "$pct" ]]; then
-    printf '  %b重传率%b    %s%%%b（自开机累计，实时判定按 8）%b\n' "$DIM" "$RESET" "$pct" "$DIM" "$RESET"
+
+  panel_title 'NetShape · 落地鸡'
+  printf '  %bHTB 出口%b   %b\n' "$DIM" "$RESET" "$cap_text"
+  printf '  %b到中转%b     %s ms\n' "$DIM" "$RESET" "$RTT_MS"
+  printf '  %bTCP%b        BBR + fq ｜ 缓冲 %s%b（固定）%b\n' "$DIM" "$RESET" "$(format_bytes "$cap")" "$DIM" "$RESET"
+  if [[ "$LIMIT_MODE" != adaptive && "$SHAPING" != off ]]; then
+    printf '  %b队列%b       burst %s KiB ｜ fq leaf %s / %s\n' \
+      "$DIM" "$RESET" "$burst" "${leaf%% *}" "${leaf##* }"
   fi
-  drift="$(qdisc_drift "$(panel_iface)" "$SHAPING" "$LIMIT_MODE" "${SHAPER_MODE:-auto}" "$TOTAL_MBPS")"
-  if [[ -n "$drift" ]]; then
-    printf '  %b[!] 实际生效的队列是 %s，与上面的策略不一致%b\n' "$YELLOW" "$drift" "$RESET"
-    printf '      %b可能被其他服务覆盖或重启后未应用，按 a 重新应用%b\n' "$DIM" "$RESET"
+  printf '  %binitcwnd%b   %s\n' "$DIM" "$RESET" "$( (( INITCWND > 0 )) && printf '%s' "$INITCWND" || printf '关闭' )"
+
+  actual="$(root_qdisc_kind "$(panel_iface)")"
+  if [[ -n "$actual" && "$SHAPING" != off && "$LIMIT_MODE" != adaptive \
+        && "$actual" != htb && "$actual" != tbf ]]; then
+    printf '  %b[!] 实际 root qdisc 是 %s，HTB 没有生效 —— 按 a 重新应用%b\n' "$YELLOW" "$actual" "$RESET"
   fi
-  snippet="$(nginx_snippet_state)"
-  [[ "$snippet" == unlinked ]] && printf '  %b[!] Nginx 反代片段没有被任何站点 include，等于没生效%b\n' "$YELLOW" "$RESET"
+  if [[ "$LIMIT_MODE" == adaptive && "$SHAPING" != off ]]; then
+    printf '  %b[!] 没有 aggregate 上限；上游若有 policer，近线速时会大量重传%b\n' "$YELLOW" "$RESET"
+  fi
   rule_light
-  printf '  %b落地鸡调优%b  %b（同区域低延迟，无跨境限速器）%b\n' "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '    %b1)%b 整机总出口上限%b（保护端口，当前：%s）%b\n' "$BOLD" "$RESET" "$DIM" "$total_text" "$RESET"
-  printf '    %b2)%b 修改到中转机的延迟%b（当前：%s ms）%b\n' "$BOLD" "$RESET" "$DIM" "$RTT_MS" "$RESET"
-  printf '    %b3)%b 修改回源延迟参考%b（当前：%s ms）%b\n' "$BOLD" "$RESET" "$DIM" "$ORIGIN_RTT_MS" "$RESET"
-  printf '    %b4)%b 切回中转/观看模式%b（客户端在家宽另一端时用）%b\n' "$BOLD" "$RESET" "$DIM" "$RESET"
-  printf '  %b查看与工具%b\n' "$BOLD" "$RESET"
-  printf '    %b8)%b 状态与诊断（重传、冲突、Nginx 审计）\n' "$BOLD" "$RESET"
-  printf '    %ba)%b 重新应用当前配置\n' "$BOLD" "$RESET"
+  printf '  %b1)%b 设置出口上限%b（按端口档位）%b\n' "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '  %b2)%b 修改到中转机的延迟%b（当前 %s ms）%b\n' "$BOLD" "$RESET" "$DIM" "$RTT_MS" "$RESET"
+  printf '  %b3)%b 切回中转/观看模式\n' "$BOLD" "$RESET"
+  rule_light
+  printf '  %b8)%b 状态与诊断      %ba)%b 重新应用\n' "$BOLD" "$RESET" "$BOLD" "$RESET"
   if [[ "$SHAPING" == off ]]; then
-    printf '    %bp)%b %b恢复人为限速%b\n' "$BOLD" "$RESET" "$GREEN" "$RESET"
+    printf '  %bp)%b %b恢复限速%b        %bu)%b 卸载 NetShape\n' "$BOLD" "$RESET" "$GREEN" "$RESET" "$BOLD" "$RESET"
   else
-    printf '    %bp)%b 暂停人为限速（保留 fq 公平排队）\n' "$BOLD" "$RESET"
+    printf '  %bp)%b 暂停限速        %bu)%b 卸载 NetShape\n' "$BOLD" "$RESET" "$BOLD" "$RESET"
   fi
-  printf '    %b0)%b 退出\n' "$BOLD" "$RESET"
+  printf '  %b0)%b 退出\n' "$BOLD" "$RESET"
   rule_light
 }
 
@@ -1956,6 +2417,7 @@ render_menu() {
   printf '    %ba)%b 重新应用当前配置（队列被覆盖或重启后用）\n' "$BOLD" "$RESET"
   printf '    %bb)%b 切换整形突发模式%b（当前：%s，限速线路建议小突发）%b\n' "$BOLD" "$RESET" "$DIM" "$(burst_mode_short "${BURST_MODE:-policer}")" "$RESET"
   printf '    %bl)%b 切换为落地鸡模式%b（与中转机同区域、个位数延迟）%b\n' "$BOLD" "$RESET" "$DIM" "$RESET"
+  printf '    %bu)%b 卸载 NetShape%b（还原内核参数与队列）%b\n' "$BOLD" "$RESET" "$DIM" "$RESET"
   if [[ "$SHAPING" == off ]]; then
     printf '    %bp)%b %b恢复人为限速%b\n' "$BOLD" "$RESET" "$GREEN" "$RESET"
   else
@@ -1989,35 +2451,32 @@ menu() {
     load_config
     if [[ "$ROLE" == landing ]]; then
       render_landing_menu
-      if ! read -r -p '  请选择 [0-4 / 8 / a / p]: ' answer; then
+      if ! read -r -p '  请选择: ' answer; then
         printf '\n'
         return 0
       fi
       case "$answer" in
         1)
-          if value="$(prompt_total_mbps)"; then
+          if value="$(prompt_landing_cap)"; then
             run_action set_landing "$value"
           else
             info "已取消，保持当前策略"; continue
           fi
           ;;
         2)
-          if value="$(prompt_uint '  到中转机的延迟（ms，同机房通常个位数，q 返回）' "$RTT_MS" 1 3000)"; then
+          if value="$(prompt_uint '  到中转机的延迟（ms，同机房通常 1-2ms，q 返回）' "$RTT_MS" 1 3000)"; then
             run_action set_rtt "$value"
           else
             info "已取消，保持当前策略"; continue
           fi
           ;;
-        3)
-          if value="$(prompt_uint '  回源延迟参考（ms，决定接收缓冲，q 返回）' "$ORIGIN_RTT_MS" 1 3000)"; then
-            run_action set_origin_rtt "$value"
-          else
-            info "已取消，保持当前策略"; continue
-          fi
-          ;;
-        4) run_action set_relay_role ;;
+        3) run_action set_relay_role ;;
         8) run_action diagnose ;;
         a|A) run_action apply_all ;;
+        u|U)
+          if confirm_uninstall; then run_action uninstall_all; return 0; fi
+          info "已取消"; continue
+          ;;
         p|P)
           if [[ "$SHAPING" == off ]]; then run_action set_resume; else run_action set_off; fi
           ;;
@@ -2028,7 +2487,7 @@ menu() {
       continue
     fi
     render_menu
-    if ! read -r -p '  请选择 [0-9 / a / b / l / p]: ' answer; then
+    if ! read -r -p '  请选择: ' answer; then
       printf '\n'
       return 0
     fi
@@ -2068,11 +2527,15 @@ menu() {
         ;;
       a|A) run_action apply_all ;;
       l|L)
-        if value="$(prompt_total_mbps)"; then
+        if value="$(prompt_landing_cap)"; then
           run_action set_landing "$value"
         else
           info "已取消，保持当前策略"; continue
         fi
+        ;;
+      u|U)
+        if confirm_uninstall; then run_action uninstall_all; return 0; fi
+        info "已取消"; continue
         ;;
       b|B)
         if [[ "${BURST_MODE:-policer}" == policer ]]; then
@@ -2118,9 +2581,8 @@ NetShape Manager - 单连接上限 + 整机总出口 双层限速 SSH 面板
   netshape burst policer   小突发整形（默认，贴合限速线路）
   netshape burst throughput 大突发整形（10ms 令牌，仅干净直连线路）
   netshape initcwnd 32     初始拥塞窗口（0 = 不修改默认路由）
-  netshape landing 0       切换为落地鸡模式（参数 = 整机总出口，0 = 不限）
+  netshape landing 980     切换为落地鸡模式（参数 = HTB aggregate 上限，0 = 不限）
   netshape relay           切回中转/观看模式
-  netshape origin-rtt 150  落地鸡回源延迟参考（决定接收缓冲）
   netshape status          查看机器、TCP、qdisc、class 和重传
   netshape diagnose        检查重复 sysctl/旧服务并审计 Nginx
   netshape nginx-snippet   生成 Emby 不限流片段（本机自建反代时用）
@@ -2129,9 +2591,16 @@ NetShape Manager - 单连接上限 + 整机总出口 双层限速 SSH 面板
 
 机器角色：
   中转/观看机  客户端在家宽另一端、跨境线路：双层限速 + 小突发，压住重传。
-  落地鸡       与中转机同区域、延迟个位数、没有跨境限速器：不限单连接，
-               接收缓冲按「回源延迟」而不是到中转机的个位数延迟计算，
-               端口范围/TIME_WAIT/conntrack/文件句柄按出口节点放大。
+  落地鸡       与中转机同区域、RTT 约 1ms，出口前面通常有商家的 policer：
+               BBR + 固定 32MiB 缓冲（不按 BDP 放大）
+               HTB aggregate 限住整机出口 + fq leaf 做 pacing
+               小突发、关闭 initcwnd
+               不主动修改 tcp_mem / keepalive / conntrack / 端口范围
+               端口档位 → HTB：500M→490、1G→980、2G→1960、2.5G→2450
+
+  落地鸡实测：不整形时撞在约 1Gbps、15 秒重传 14 万次；
+  HTB 950M 之后稳定在 902-908Mbps，重传降到几十次。
+  HTB 数值不等于 iperf3 payload，重点是把重传压下去，不是让测速刚好 1000M。
 
 说明：两层限速各管一件事——
 单连接上限压在观看设备家宽以下（500M→430/450，1G→850/900），
