@@ -630,8 +630,8 @@ rm -f "$softnet_fixture"
 rel_dir="$(mktemp -d)"
 _sf="$SYSCTL_FILE"; _snap="$SNAPSHOT_FILE"
 SYSCTL_FILE="$rel_dir/ns.conf"; SNAPSHOT_FILE="$rel_dir/snap"
-printf 'net.ipv4.tcp_fin_timeout = 15\nnet.ipv4.tcp_keepalive_time = 600\n' > "$SYSCTL_FILE"
-printf '# PRISTINE=1\nnet.ipv4.tcp_fin_timeout=60\nnet.ipv4.tcp_keepalive_time=7200\n' > "$SNAPSHOT_FILE"
+printf 'net.ipv4.tcp_fin_timeout = 15\nnet.ipv4.tcp_keepalive_time = 600\nnet.core.rmem_max = 33554432\n' > "$SYSCTL_FILE"
+printf '# PRISTINE=1\nnet.ipv4.tcp_fin_timeout=60\nnet.ipv4.tcp_keepalive_time=7200\nnet.core.rmem_max=212992\n' > "$SNAPSHOT_FILE"
 rel_log="$rel_dir/log"
 has() { [[ "$1" == sysctl ]]; }
 # keepalive still holds what we wrote (600); fin_timeout was changed to 30.
@@ -653,6 +653,10 @@ pass 'a sysctl the user changed after us is left alone'
 [[ "$(cat "$rel_log")" == *'net.ipv4.tcp_keepalive_time=7200'* ]] \
   || fail 'a key still holding our value should be restored'
 pass 'a sysctl still holding our value is restored to the factory snapshot'
+# Field bug: the newline-separated key list never matched, so a relay
+# re-apply "restored 41 keys" — every key it was about to write again.
+[[ "$(cat "$rel_log")" != *rmem_max* ]] || fail 'a key the mode still manages must not be released'
+pass 'keys the mode still manages are never released'
 # Without a pristine snapshot nothing may be written at all.
 printf '# PRISTINE=0\nnet.ipv4.tcp_fin_timeout=60\n' > "$SNAPSHOT_FILE"
 : > "$rel_log"

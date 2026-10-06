@@ -732,7 +732,10 @@ net.ipv4.udp_wmem_min
 # restore them from the factory snapshot when we have a trustworthy one, and
 # say so plainly when we do not rather than guessing kernel defaults.
 release_unmanaged_keys() {
-  local keep=" ${1:-} " key value released=0
+  local keep key value released=0
+  # The key lists are newline-separated; match on spaces only, or no key ever
+  # counts as kept and every apply resets the whole profile to factory first.
+  keep=" $(printf '%s' "${1:-}" | tr -s '[:space:]' ' ') "
   local stale=()
   [[ -r "$SYSCTL_FILE" ]] || return 0
   while read -r key; do
