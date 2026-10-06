@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="5.4.2"
+VERSION="5.4.3"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -136,10 +136,15 @@ tcp_mem_values() {
   # uses field-proven values from a stable 2 GiB relay host.
   local mem="$1" pg low pres max
   if (( mem < 1024 )); then
-    # Below 1 GiB: RAM/16, /8, /4. The old fixed 384 MB ceiling was 86% of
-    # a 512M VPS (MemTotal ~445 MB) and could push the proxy itself into OOM.
+    # Below 1 GiB: RAM/8, /4, /2. The old fixed 384 MB ceiling was 86% of a
+    # 512M VPS (MemTotal ~445 MB). 5.4.1 tried RAM/16, /8, /4 instead, and a
+    # single 1 Gbps / 190 ms relay stream (two sockets: upstream rx + client
+    # tx) crossed the 55 MB pressure line: TCPMemoryPressures 3, PruneCalled
+    # 14, RcvQDrop 7 in one speed test, speed capped near 450 Mbps and
+    # sawtoothing. Pressure at RAM/4 keeps one full-speed relay pair clear of
+    # it; the hard ceiling at RAM/2 still leaves the other half to the proxy.
     pg=$(( mem * 256 ))
-    low=$(( pg / 16 )); pres=$(( pg / 8 )); max=$(( pg / 4 ))
+    low=$(( pg / 8 )); pres=$(( pg / 4 )); max=$(( pg / 2 ))
     (( low < 4096 )) && low=4096
     (( pres < 8192 )) && pres=8192
     (( max < 16384 )) && max=16384
@@ -154,8 +159,10 @@ tcp_mem_values() {
 # Per-socket ceiling. Physical RAM is not what limits a single stream; the
 # kernel already enforces tcp_mem as a hard global total, so a large
 # per-socket ceiling cannot OOM the host — at worst TCP enters memory
-# pressure and shrinks buffers. The only rule kept here: one socket may take
-# at most half of the tcp_mem ceiling, so two full-speed flows always fit.
+# pressure and shrinks buffers. The rule kept here: one socket may take at
+# most half of the tcp_mem *pressure* threshold. A relay stream is two
+# sockets (upstream receive + client send); both at full size must stay
+# below the point where the kernel starts pruning and dropping.
 #
 # History: this used to be RAM/32 (and before that a nominal-size ladder).
 # On a 1c512m relay at 190 ms, single-stream speed tracked the cap exactly:
@@ -163,7 +170,7 @@ tcp_mem_values() {
 # buffer. The cap, not the RAM, was the ceiling.
 tcp_mem_budget_cap() {
   local mem="$1" pages
-  pages="$(tcp_mem_values "$mem" | awk '{print $3}')"
+  pages="$(tcp_mem_values "$mem" | awk '{print $2}')"
   printf '%s\n' $(( pages * 4096 / 2 / 1048576 * 1048576 ))
 }
 

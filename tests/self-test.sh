@@ -34,16 +34,17 @@ assert_eq 38797312 "$(calculate_tcp_max 950 160 1024)" '1G RAM no longer truncat
 # RAM size is not the per-socket limit any more; half the tcp_mem ceiling is.
 # Field case: 1c512m relay (MemTotal 445) tracked the cap linearly —
 # 8 MiB -> 241 Mbps, 13 MiB -> 375 Mbps at 190 ms.
-assert_eq 57671680 "$(memory_buffer_cap 445)" '512M VPS: half of a ~111 MB tcp_mem ceiling = 55 MiB'
-assert_eq 125829120 "$(memory_buffer_cap 965)" '1G VPS: half of a ~241 MB tcp_mem ceiling = 120 MiB'
-assert_eq 268435456 "$(memory_buffer_cap 2048)" 'large tcp_mem budgets still stop at 256 MiB'
+assert_eq 57671680 "$(memory_buffer_cap 445)" '512M VPS: half of the ~111 MB pressure line = 55 MiB'
+assert_eq 125829120 "$(memory_buffer_cap 965)" '1G VPS: half of the ~241 MB pressure line = 120 MiB'
+assert_eq 201326592 "$(memory_buffer_cap 2048)" '2G VPS: half of the 384 MB pressure line = 192 MiB'
+assert_eq 268435456 "$(memory_buffer_cap 8192)" 'large tcp_mem budgets still stop at 256 MiB'
 assert_eq 42991616 "$(calculate_tcp_max 1000 170 445)" '1000M/170ms on a 512M VPS gets the full 2x BDP (41 MiB)'
 assert_eq 17825792 "$(calculate_tcp_max 430 160 445)" 'default relay on 512M VPS is 2x BDP'
 assert_eq 17825792 "$(calculate_tcp_max 430 160 1950)" '2G VPS unchanged: still 2x BDP'
-assert_eq 33554432 "$(calculate_tcp_max 2000 300 128)" 'tiny box: pinned at half the floored tcp_mem ceiling'
+assert_eq 16777216 "$(calculate_tcp_max 2000 300 128)" 'tiny box: pinned at half the floored pressure line'
 assert_eq /proc/sys/net/ipv4/tcp_rmem "$(sysctl_path net.ipv4.tcp_rmem)" 'sysctl key path'
-assert_eq '8192 16384 32768' "$(tcp_mem_values 512)" 'small RAM tcp_mem is RAM/16 /8 /4'
-assert_eq '7120 14240 28480' "$(tcp_mem_values 445)" '512M VPS tcp_mem ceiling ~111 MB, not 384 MB'
+assert_eq '16384 32768 65536' "$(tcp_mem_values 512)" 'small RAM tcp_mem is RAM/8 /4 /2'
+assert_eq '14240 28480 56960' "$(tcp_mem_values 445)" '512M VPS: pressure ~111 MB, ceiling ~222 MB (not 384 MB)'
 assert_eq '4096 8192 16384' "$(tcp_mem_values 128)" 'tiny RAM tcp_mem floors'
 assert_eq 4294967295 "$(relay_notsent_lowat 190 1)" 'single core: notsent_lowat unlimited'
 assert_eq 16384 "$(relay_notsent_lowat 190 2)" 'multi-core long RTT keeps 16 KiB'
@@ -88,10 +89,10 @@ assert_eq '40960 8192' "$(fq_leaf_limits 2048)" 'normal fq leaf limits'
 assert_eq '2 倍 BDP' "$(buffer_cap_reason 450 160 2048)" 'buffer pinned by BDP'
 assert_eq '受 445 MB 内存限制' "$(buffer_cap_reason 2000 250 445)" 'buffer pinned by the tcp_mem budget'
 assert_eq '下限 8 MiB' "$(buffer_cap_reason 100 20 2048)" 'buffer pinned by floor'
-# One socket may never take more than half the global tcp_mem ceiling.
+# A relay pair (rx + tx socket) at full size must fit under tcp_mem pressure.
 for _mem in 128 256 445 512 965 1024 2048 4096 8192 65536; do
   _cap="$(memory_buffer_cap "$_mem")"
-  _budget=$(( $(tcp_mem_values "$_mem" | awk '{print $3}') * 4096 / 2 ))
+  _budget=$(( $(tcp_mem_values "$_mem" | awk '{print $2}') * 4096 / 2 ))
   (( _cap <= _budget )) || { printf 'FAIL: buffer cap %s exceeds tcp_mem budget %s at %s MB\n' "$_cap" "$_budget" "$_mem" >&2; exit 1; }
 done
 printf 'PASS: buffer cap stays within the tcp_mem budget on every RAM tier\n'
@@ -490,9 +491,9 @@ TEST_MEM_MB=445 TEST_CPUS=1
 write_sysctl_profile >/dev/null 2>&1
 relay_conf="$(cat "$SYSCTL_FILE")"
 [[ "$relay_conf" == *'net.ipv4.tcp_wmem = 4096 65536 17825792'* ]] || fail '1c512m relay wmem should be the full 2x BDP (17 MiB at 430/160)'
-[[ "$relay_conf" == *'net.ipv4.tcp_mem = 7120 14240 28480'* ]] || fail '1c512m relay tcp_mem should be RAM/16 /8 /4'
+[[ "$relay_conf" == *'net.ipv4.tcp_mem = 14240 28480 56960'* ]] || fail '1c512m relay tcp_mem should be RAM/8 /4 /2'
 [[ "$relay_conf" == *'net.ipv4.tcp_notsent_lowat = 4294967295'* ]] || fail '1c512m relay should not cap notsent'
-pass '1c512m relay gets full 2x BDP buffers, a RAM/4 tcp_mem ceiling and no notsent cap'
+pass '1c512m relay gets full 2x BDP buffers, RAM/4 tcp_mem pressure and no notsent cap'
 TEST_CPUS=2
 write_sysctl_profile >/dev/null 2>&1
 [[ "$(cat "$SYSCTL_FILE")" == *'net.ipv4.tcp_notsent_lowat = 16384'* ]] || fail '2-core relay keeps 16 KiB notsent'
