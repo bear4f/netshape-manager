@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="5.4.0"
+VERSION="5.4.1"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -134,9 +134,16 @@ recommended_rate() {
 tcp_mem_values() {
   # Global TCP memory in 4 KiB pages, scaled by RAM. The 1-4 GiB tier
   # uses field-proven values from a stable 2 GiB relay host.
-  local mem="$1"
+  local mem="$1" pg low pres max
   if (( mem < 1024 )); then
-    printf '32768 49152 98304\n'
+    # Below 1 GiB: RAM/16, /8, /4. The old fixed 384 MB ceiling was 86% of
+    # a 512M VPS (MemTotal ~445 MB) and could push the proxy itself into OOM.
+    pg=$(( mem * 256 ))
+    low=$(( pg / 16 )); pres=$(( pg / 8 )); max=$(( pg / 4 ))
+    (( low < 4096 )) && low=4096
+    (( pres < 8192 )) && pres=8192
+    (( max < 16384 )) && max=16384
+    printf '%s %s %s\n' "$low" "$pres" "$max"
   elif (( mem < 4096 )); then
     printf '65536 98304 196608\n'
   else
@@ -182,6 +189,22 @@ calculate_tcp_max() {
   cap="$(memory_buffer_cap "$mem")"
   (( target > cap )) && target="$cap"
   printf '%s\n' "$target"
+}
+
+# 1 vCPU: no notsent_lowat at all (kernel default, unlimited). 16 KiB is
+# ~0.5 ms of data at 250 Mbps; on a single core any proxy stall longer than
+# that (GC, TLS batching, steal) drains the socket, BBR marks the round
+# app-limited and the rate sags. Multi-core hosts keep the low watermark
+# that keeps Emby seeks responsive.
+relay_notsent_lowat() {
+  local rtt="$1" cpus="$2"
+  if (( cpus <= 1 )); then
+    printf '4294967295\n'
+  elif (( rtt >= 120 )); then
+    printf '16384\n'
+  else
+    printf '32768\n'
+  fi
 }
 
 # Which rule pinned the buffer ceiling. Without this a user who sees a
@@ -828,7 +851,7 @@ write_sysctl_profile() {
   wmax="$rmax"
   if (( mem < 1024 )); then backlog=4096; else backlog=16384; fi
   if (( mem < 1024 )); then min_free=32768; else min_free=65536; fi
-  if (( RTT_MS >= 120 )); then notsent=16384; else notsent=32768; fi
+  notsent="$(relay_notsent_lowat "$RTT_MS" "$(cpu_count)")"
   tcpmem="$(tcp_mem_values "$mem")"
   somaxconn=2048; syn_backlog=2048; port_range='32768 60999'
   tw_buckets=32768; file_max=262144; conntrack=65536
@@ -901,7 +924,7 @@ write_sysctl_profile() {
   if has sysctl; then
     sysctl -p "$SYSCTL_FILE" >/dev/null || die "sysctl 加载失败；配置文件保留在 $SYSCTL_FILE 供检查"
   fi
-  log "TCP 配置已更新：${cc}，缓冲上限 $(format_bytes "$rmax")（$(buffer_cap_reason "$RATE_MBPS" "$RTT_MS" "$mem")），notsent ${notsent}B"
+  log "TCP 配置已更新：${cc}，缓冲上限 $(format_bytes "$rmax")（$(buffer_cap_reason "$RATE_MBPS" "$RTT_MS" "$mem")），notsent $( (( notsent == 4294967295 )) && printf '不限（单核）' || printf '%sB' "$notsent")"
   if (( rmax < RATE_MBPS * RTT_MS * 125 )); then
     warn "内存较小，TCP 缓冲上限低于单流 BDP；高 RTT 下单连接可能无法跑满线路"
   fi

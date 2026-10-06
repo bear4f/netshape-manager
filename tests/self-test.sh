@@ -40,7 +40,12 @@ assert_eq 17825792 "$(calculate_tcp_max 430 160 965)" 'default relay on 1G VPS i
 assert_eq 17825792 "$(calculate_tcp_max 430 160 1950)" '2G VPS unchanged: still 2x BDP'
 assert_eq 8388608 "$(memory_buffer_cap 200)" 'tiny box keeps the 8 MiB floor'
 assert_eq /proc/sys/net/ipv4/tcp_rmem "$(sysctl_path net.ipv4.tcp_rmem)" 'sysctl key path'
-assert_eq '32768 49152 98304' "$(tcp_mem_values 512)" 'small RAM tcp_mem'
+assert_eq '8192 16384 32768' "$(tcp_mem_values 512)" 'small RAM tcp_mem is RAM/16 /8 /4'
+assert_eq '7120 14240 28480' "$(tcp_mem_values 445)" '512M VPS tcp_mem ceiling ~111 MB, not 384 MB'
+assert_eq '4096 8192 16384' "$(tcp_mem_values 128)" 'tiny RAM tcp_mem floors'
+assert_eq 4294967295 "$(relay_notsent_lowat 190 1)" 'single core: notsent_lowat unlimited'
+assert_eq 16384 "$(relay_notsent_lowat 190 2)" 'multi-core long RTT keeps 16 KiB'
+assert_eq 32768 "$(relay_notsent_lowat 60 4)" 'multi-core short RTT keeps 32 KiB'
 assert_eq '65536 98304 196608' "$(tcp_mem_values 2047)" 'mid RAM tcp_mem'
 assert_eq '131072 196608 393216' "$(tcp_mem_values 8192)" 'large RAM tcp_mem'
 assert_eq 550 "$(calculate_htb_burst_kb 450 throughput)" '450M HTB burst (throughput)'
@@ -476,6 +481,21 @@ done
 pass 'relay still writes its full original key set'
 [[ "$relay_conf" == *'net.ipv4.tcp_fastopen = 0'* ]] || fail 'relay keeps TFO off'
 pass 'relay keeps TCP Fast Open off for cross-border middleboxes'
+
+# The field case: de-ber03 1c512m, MemTotal 455764 kB, 1 vCPU.
+cpu_count() { printf '%s\n' "${TEST_CPUS:-4}"; }
+TEST_MEM_MB=445 TEST_CPUS=1
+write_sysctl_profile >/dev/null 2>&1
+relay_conf="$(cat "$SYSCTL_FILE")"
+[[ "$relay_conf" == *'net.ipv4.tcp_wmem = 4096 65536 13631488'* ]] || fail '1c512m relay wmem should be 13 MiB'
+[[ "$relay_conf" == *'net.ipv4.tcp_mem = 7120 14240 28480'* ]] || fail '1c512m relay tcp_mem should be RAM/16 /8 /4'
+[[ "$relay_conf" == *'net.ipv4.tcp_notsent_lowat = 4294967295'* ]] || fail '1c512m relay should not cap notsent'
+pass '1c512m relay gets 13 MiB buffers, a RAM/4 tcp_mem ceiling and no notsent cap'
+TEST_CPUS=2
+write_sysctl_profile >/dev/null 2>&1
+[[ "$(cat "$SYSCTL_FILE")" == *'net.ipv4.tcp_notsent_lowat = 16384'* ]] || fail '2-core relay keeps 16 KiB notsent'
+pass 'multi-core relay keeps its notsent_lowat'
+unset TEST_MEM_MB TEST_CPUS
 SYSCTL_FILE="$_orig_sysctl_file"; STATE_DIR="$_orig_state"
 rm -rf "$prof_dir"
 
