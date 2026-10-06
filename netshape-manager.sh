@@ -154,20 +154,16 @@ tcp_mem_budget_cap() {
 
 memory_buffer_cap() {
   local mem="$1" cap budget
-  if (( mem < 512 )); then
-    cap=$((8 * 1024 * 1024))
-  elif (( mem < 1024 )); then
-    cap=$((16 * 1024 * 1024))
-  elif (( mem < 2048 )); then
-    cap=$((32 * 1024 * 1024))
-  elif (( mem < 4096 )); then
-    cap=$((64 * 1024 * 1024))
-  else
-    cap=$((128 * 1024 * 1024))
-  fi
-  # The ladder above is field-proven and today it is stricter than the budget
-  # rule everywhere; the invariant is kept as a guard so editing the ladder
-  # cannot silently let one socket eat the whole tcp_mem ceiling.
+  # RAM/32, continuous, rounded down to 1 MiB. This used to be a ladder keyed
+  # on nominal sizes (512/1024/2048...), but MemTotal always sits below the
+  # nominal size — a 512M VPS reports ~445 MB, a 1G one ~965 MB — so every
+  # box landed one tier low. A real 1c512m relay was pinned at 8 MiB and
+  # topped out around 240-280 Mbps at 190 ms. A continuous rule has no tier
+  # edges to fall off. Above ~600 MB RAM the 2x BDP target at default
+  # 430M/160ms binds first, so larger hosts are unaffected.
+  cap=$(( mem * 32768 / 1048576 * 1048576 ))
+  (( cap < 8388608 )) && cap=8388608
+  # Guard: one socket must never be able to eat the whole tcp_mem ceiling.
   budget="$(tcp_mem_budget_cap "$mem")"
   (( cap > budget )) && cap="$budget"
   (( cap > 268435456 )) && cap=268435456
