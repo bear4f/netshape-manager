@@ -5,7 +5,7 @@
 set -Eeuo pipefail
 IFS=$'\n\t'
 
-VERSION="5.4.1"
+VERSION="5.4.2"
 PROGRAM="netshape"
 INSTALL_FILE="/usr/local/sbin/netshape-manager"
 CLI_FILE="/usr/local/bin/netshape"
@@ -151,28 +151,26 @@ tcp_mem_values() {
   fi
 }
 
-# A single socket must never be allowed to monopolise the global TCP budget:
-# tcp_mem's ceiling divided by 8 leaves room for 8 concurrent large flows.
+# Per-socket ceiling. Physical RAM is not what limits a single stream; the
+# kernel already enforces tcp_mem as a hard global total, so a large
+# per-socket ceiling cannot OOM the host — at worst TCP enters memory
+# pressure and shrinks buffers. The only rule kept here: one socket may take
+# at most half of the tcp_mem ceiling, so two full-speed flows always fit.
+#
+# History: this used to be RAM/32 (and before that a nominal-size ladder).
+# On a 1c512m relay at 190 ms, single-stream speed tracked the cap exactly:
+# 8 MiB -> 241 Mbps, 13 MiB -> 375 Mbps, in-flight steady at ~0.65 of the
+# buffer. The cap, not the RAM, was the ceiling.
 tcp_mem_budget_cap() {
   local mem="$1" pages
   pages="$(tcp_mem_values "$mem" | awk '{print $3}')"
-  printf '%s\n' $(( pages * 4096 / 8 ))
+  printf '%s\n' $(( pages * 4096 / 2 / 1048576 * 1048576 ))
 }
 
 memory_buffer_cap() {
-  local mem="$1" cap budget
-  # RAM/32, continuous, rounded down to 1 MiB. This used to be a ladder keyed
-  # on nominal sizes (512/1024/2048...), but MemTotal always sits below the
-  # nominal size — a 512M VPS reports ~445 MB, a 1G one ~965 MB — so every
-  # box landed one tier low. A real 1c512m relay was pinned at 8 MiB and
-  # topped out around 240-280 Mbps at 190 ms. A continuous rule has no tier
-  # edges to fall off. Above ~600 MB RAM the 2x BDP target at default
-  # 430M/160ms binds first, so larger hosts are unaffected.
-  cap=$(( mem * 32768 / 1048576 * 1048576 ))
+  local mem="$1" cap
+  cap="$(tcp_mem_budget_cap "$mem")"
   (( cap < 8388608 )) && cap=8388608
-  # Guard: one socket must never be able to eat the whole tcp_mem ceiling.
-  budget="$(tcp_mem_budget_cap "$mem")"
-  (( cap > budget )) && cap="$budget"
   (( cap > 268435456 )) && cap=268435456
   printf '%s\n' "$cap"
 }
